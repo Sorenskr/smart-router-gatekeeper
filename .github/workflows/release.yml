@@ -1,0 +1,78 @@
+name: Build and Release Gatekeeper
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Validate Frontend JS Syntax
+        run: |
+          node --check web/dashboard.js
+          node --check web/portal.js
+
+      - name: Go Vet & Unit Tests
+        run: |
+          go vet ./...
+          GOOS=linux GOARCH=arm64 go vet ./...
+          go test -v ./...
+
+      - name: Cross-Compile Binaries
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o dist/gatekeeper-linux-arm64 .
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/gatekeeper-windows-amd64.exe .
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o dist/gatekeeper-macos-arm64 .
+
+      - name: Package Portable Windows Kit
+        run: |
+          mkdir -p kit/dist kit/scripts
+          cp dist/gatekeeper-windows-amd64.exe kit/dist/
+          cp dist/gatekeeper-linux-arm64 kit/dist/
+          cp scripts/deploy_to_immortalwrt.ps1 kit/scripts/
+          cp scripts/deploy_to_immortalwrt.sh kit/scripts/
+          cp 双击启动-本地模拟体验.bat kit/
+          cp 双击部署-一键安装到软路由.bat kit/
+          cp README.md kit/
+          (cd kit && zip -r ../dist/SmartRouterGatekeeper-Windows-Kit.zip .)
+          rm -rf kit
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            ## Smart Router Gatekeeper 开箱即用下载包
+
+            - **任意 Windows 电脑一键上手包**：下载 `SmartRouterGatekeeper-Windows-Kit.zip` 解压，直接双击 `双击部署-一键安装到软路由.bat` 或 `双击启动-本地模拟体验.bat`（无需安装 Go 或任何开发软件）。
+            - **ImmortalWrt / OpenWrt (`aarch64`) 独立单文件**：`gatekeeper-linux-arm64`
+            - **Windows 本地控制台/仿真程序**：`gatekeeper-windows-amd64.exe`
+            - **macOS Apple Silicon 程序**：`gatekeeper-macos-arm64`
+          files: |
+            dist/SmartRouterGatekeeper-Windows-Kit.zip
+            dist/gatekeeper-linux-arm64
+            dist/gatekeeper-windows-amd64.exe
+            dist/gatekeeper-macos-arm64
