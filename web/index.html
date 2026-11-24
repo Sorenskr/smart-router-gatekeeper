@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Gatekeeper · 软路由准入云控面板</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <!-- 登录遮罩层 -->
+  <div id="login-overlay" class="overlay hidden">
+    <div class="panel login-card">
+      <div class="login-brand">
+        <div class="brand-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>
+        </div>
+        <div>
+          <h1>Gatekeeper 云控面板</h1>
+          <p>ImmortalWrt 设备准入与全球极速管控</p>
+        </div>
+      </div>
+      <form id="login-form" class="login-form">
+        <label class="field-label" for="login-password">管理密码</label>
+        <input id="login-password" type="password" class="input" placeholder="请输入管理员密码" autocomplete="current-password" required />
+        <p id="login-hint" class="muted-hint hidden">当前处于本地仿真演示模式（默认密码：<code>admin123</code>）</p>
+        <p id="login-error" class="error-text hidden"></p>
+        <button type="submit" class="btn btn-primary btn-full">立即进入</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- 主界面 -->
+  <div id="app-shell" class="app-shell hidden">
+    <!-- 顶部极简导航栏 -->
+    <header class="topbar panel">
+      <div class="topbar-left">
+        <div class="brand-badge">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>
+        </div>
+        <div>
+          <div class="topbar-title-row">
+            <span class="topbar-title">Gatekeeper 路由器管控</span>
+            <span id="mode-badge" class="pill pill-info">检测中</span>
+          </div>
+          <div class="topbar-sub">
+            <span id="ws-dot" class="dot dot-amber"></span>
+            <span id="ws-status-text">连接中...</span>
+            <span class="sep">·</span>
+            <span id="router-meta">网关 192.168.6.1</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="topbar-actions">
+        <a id="open-portal-link" href="/portal" target="_blank" class="btn btn-ghost btn-sm">手机认证页</a>
+        <button id="btn-toggle-tunnel" type="button" class="btn btn-ghost btn-sm">
+          <span id="tunnel-nav-dot" class="dot dot-gray"></span>
+          <span>远程访问</span>
+        </button>
+        <button id="btn-open-audit" type="button" class="btn btn-ghost btn-sm">审计/规则</button>
+        <button id="btn-open-guide" type="button" class="btn btn-ghost btn-sm">操作说明</button>
+        <button id="btn-sound-toggle" type="button" class="btn btn-ghost btn-sm"><span id="sound-label">提示音开</span></button>
+        <button id="btn-settings" type="button" class="btn btn-ghost btn-sm">设置</button>
+        <button id="btn-logout" type="button" class="btn btn-danger-ghost btn-sm">退出</button>
+      </div>
+    </header>
+
+    <!-- 管理机防锁死提醒 -->
+    <div id="whitelist-banner" class="alert-banner panel hidden">
+      <div class="alert-banner-content">
+        <strong>防锁死提醒：</strong>
+        <span id="whitelist-banner-text">当前控制终端尚未列入永久白名单，建议一键保护防误断网。</span>
+      </div>
+      <button id="btn-protect-viewer" type="button" class="btn btn-primary btn-sm">一键保护当前主机</button>
+    </div>
+
+    <!-- 紧凑 4 指标卡 -->
+    <section class="kpi-grid">
+      <article class="panel kpi-card">
+        <div class="kpi-head">
+          <span class="kpi-title">在线授权 / 最大上限</span>
+          <div class="stepper" title="点击快速调整最大同时在线授权台数">
+            <button id="btn-max-dec" type="button" class="stepper-btn">−</button>
+            <button id="btn-max-inc" type="button" class="stepper-btn">+</button>
+          </div>
+        </div>
+        <div class="kpi-value"><span id="kpi-auth-count">0</span> <span class="kpi-slash">/</span> <span id="kpi-max-count">2</span> <span class="kpi-unit">台</span></div>
+        <div class="progress-track"><div id="kpi-quota-bar" class="progress-fill" style="width: 0%"></div></div>
+        <div id="kpi-auth-sub" class="kpi-sub">含白名单 0 台（不占名额）</div>
+      </article>
+
+      <article id="kpi-pending-card" class="panel kpi-card">
+        <div class="kpi-head">
+          <span class="kpi-title">待审批申请</span>
+          <span id="kpi-pending-badge" class="pill pill-muted">无新申请</span>
+        </div>
+        <div class="kpi-value"><span id="kpi-pending-count">0</span> <span class="kpi-unit">台</span></div>
+        <div id="kpi-pending-sub" class="kpi-sub">新手机提交代号后会在此即时提醒</div>
+      </article>
+
+      <article class="panel kpi-card">
+        <div class="kpi-head">
+          <span class="kpi-title">已断网 / 已拦截</span>
+          <span id="kpi-total-traffic" class="pill pill-muted">↓ 0 B/s</span>
+        </div>
+        <div class="kpi-value"><span id="kpi-blocked-count">0</span> <span class="kpi-unit">台</span></div>
+        <div id="kpi-blocked-sub" class="kpi-sub">已拦截含 PassWall 代理在内的全部外网流量</div>
+      </article>
+
+      <article class="panel kpi-card">
+        <div class="kpi-head">
+          <span class="kpi-title">软路由与网络状态</span>
+          <span id="kpi-nft-badge" class="pill pill-success">防护中</span>
+        </div>
+        <div class="health-probes">
+          <div class="probe-item">
+            <span class="probe-label">国内</span>
+            <span id="probe-domestic" class="probe-val">--</span>
+          </div>
+          <div class="probe-item">
+            <span class="probe-label">代理/外网</span>
+            <span id="probe-proxy" class="probe-val">--</span>
+          </div>
+        </div>
+        <div id="kpi-health-sub" class="kpi-sub">检测中...</div>
+      </article>
+    </section>
+
+    <!-- 折叠式全球远程访问面板（点击顶部「远程访问」展开） -->
+    <section id="tunnel-drawer" class="panel tunnel-card hidden">
+      <div class="tunnel-left">
+        <div class="tunnel-title-row">
+          <strong>全球异地远程访问 (Cloudflare Tunnel)</strong>
+          <span id="tunnel-badge" class="pill pill-muted">未启用</span>
+        </div>
+        <p id="tunnel-desc" class="muted-hint">无需公网 IP 与域名，一键生成加密 HTTPS 地址，在全球任何电脑打开即可实时断网/放行设备。</p>
+        <div id="tunnel-url-box" class="tunnel-url-box hidden">
+          <span>公网地址：</span>
+          <a id="tunnel-public-url" href="#" target="_blank" rel="noopener noreferrer" class="tunnel-url-link"></a>
+          <button id="btn-copy-tunnel" type="button" class="btn btn-xs btn-ghost">复制</button>
+        </div>
+      </div>
+      <div class="tunnel-controls">
+        <select id="tunnel-mode-select" class="input input-sm">
+          <option value="quick">免域名快速隧道 (Quick)</option>
+          <option value="token">固定域名隧道 (Token)</option>
+        </select>
+        <button id="btn-tunnel-start" type="button" class="btn btn-primary btn-sm">一键开启外网访问</button>
+        <button id="btn-tunnel-stop" type="button" class="btn btn-danger-ghost btn-sm hidden">关闭隧道</button>
+      </div>
+    </section>
+
+    <!-- 待审批快捷条 -->
+    <section id="pending-strip" class="panel pending-strip hidden">
+      <div class="pending-strip-head">
+        <span class="dot dot-amber"></span>
+        <span>有新设备申请联网，点击右侧直接放行</span>
+      </div>
+      <div id="pending-cards" class="pending-cards"></div>
+    </section>
+
+    <!-- 全宽极简设备管控列表 -->
+    <section class="panel devices-section">
+      <div class="section-header">
+        <div>
+          <h2>设备列表与极速管控</h2>
+          <p class="section-sub">点击设备名可快捷备注（如“电脑”）；点击绿色「已连时长」可在 <strong>分钟 → 小时 → 天</strong> 间循环切换</p>
+        </div>
+        <div id="mock-toolbar" class="mock-toolbar hidden">
+          <button id="btn-mock-sim" type="button" class="btn btn-accent btn-sm">+ 模拟新手机</button>
+          <button id="btn-mock-reset" type="button" class="btn btn-ghost btn-sm">重置演示</button>
+        </div>
+      </div>
+
+      <!-- 极速筛选 + 排序 + 搜索栏 -->
+      <div class="control-bar">
+        <div class="filter-tabs" id="filter-tabs">
+          <button type="button" class="tab-btn active" data-filter="all">全部 <span class="tab-count" id="cnt-all">0</span></button>
+          <button type="button" class="tab-btn" data-filter="approved">已联网 <span class="tab-count" id="cnt-approved">0</span></button>
+          <button type="button" class="tab-btn" data-filter="pending">待审批 <span class="tab-count" id="cnt-pending">0</span></button>
+          <button type="button" class="tab-btn" data-filter="paused">已断网 <span class="tab-count" id="cnt-paused">0</span></button>
+          <button type="button" class="tab-btn" data-filter="whitelist">白名单 <span class="tab-count" id="cnt-whitelist">0</span></button>
+        </div>
+
+        <div class="sort-search-group">
+          <div class="sort-wrap">
+            <select id="sort-by" class="input input-sm" title="选择排序方式">
+              <option value="smart">默认排序（待审优先）</option>
+              <option value="approved_at">按联网时间</option>
+              <option value="duration">按已连时长</option>
+              <option value="rate">按实时网速</option>
+              <option value="name">按备注/名称</option>
+              <option value="ip">按 IP 地址</option>
+            </select>
+            <button id="btn-sort-dir" type="button" class="btn btn-ghost btn-sm" title="切换升序 / 降序">↓ 降序</button>
+          </div>
+          <input id="device-search" type="search" class="input input-search" placeholder="搜索名字 / 备注 / IP / MAC..." />
+        </div>
+      </div>
+
+      <!-- Keyed 增量更新容器 -->
+      <div id="devices-list" class="devices-list"></div>
+    </section>
+  </div>
+
+  <!-- 定时断网快捷浮层（全局复用单实例，极速定位零卡顿） -->
+  <div id="timed-pause-popover" class="popover panel hidden">
+    <div class="popover-title">选择定时断网时长（到期自动恢复）</div>
+    <div class="quick-grid">
+      <button type="button" class="btn btn-ghost btn-xs" data-mins="5">5 分钟</button>
+      <button type="button" class="btn btn-ghost btn-xs" data-mins="15">15 分钟</button>
+      <button type="button" class="btn btn-ghost btn-xs" data-mins="30">30 分钟</button>
+      <button type="button" class="btn btn-ghost btn-xs" data-mins="60">1 小时</button>
+      <button type="button" class="btn btn-ghost btn-xs" data-mins="120">2 小时</button>
+      <button type="button" class="btn btn-ghost btn-xs" data-mins="360">6 小时</button>
+    </div>
+    <div class="custom-pause-row">
+      <input id="custom-pause-val" type="number" min="1" max="43200" value="10" class="input input-xs" />
+      <select id="custom-pause-unit" class="input input-xs">
+        <option value="m">分钟</option>
+        <option value="h">小时</option>
+      </select>
+      <button id="btn-custom-pause-go" type="button" class="btn btn-danger btn-xs">立即断网</button>
+    </div>
+    <div class="popover-foot">
+      <button id="btn-perm-pause-go" type="button" class="btn btn-danger-ghost btn-xs btn-full">手动永久断网（直到点恢复）</button>
+    </div>
+  </div>
+
+  <!-- 并发上限冲突弹窗 -->
+  <div id="conflict-modal" class="overlay hidden">
+    <div class="panel modal-card">
+      <div class="modal-head">
+        <div>
+          <h3>已达到同时在线设备上限</h3>
+          <p id="conflict-message" class="muted-hint"></p>
+        </div>
+      </div>
+      <div class="modal-body">
+        <button id="btn-evict-oldest" type="button" class="btn btn-primary btn-full"></button>
+        <div class="conflict-divider"><span>或手动选择要下线的在线设备</span></div>
+        <div id="conflict-active-list" class="conflict-list"></div>
+      </div>
+      <div class="modal-foot">
+        <button id="btn-conflict-cancel" type="button" class="btn btn-ghost">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 极简操作指南弹窗 -->
+  <div id="guide-modal" class="overlay hidden">
+    <div class="panel modal-card">
+      <div class="modal-head">
+        <h3>极简使用说明</h3>
+        <button id="btn-guide-close" type="button" class="btn btn-ghost btn-xs">关闭</button>
+      </div>
+      <div class="guide-body">
+        <div class="guide-step"><strong>1. 给设备备注（电脑/手机等）：</strong>点击任意设备名称或编辑图标，可直接输入备注或一键点「电脑」「手机」「平板」标签保存。</div>
+        <div class="guide-step"><strong>2. 查看联网时间与时长：</strong>设备名称下方显示「何时联网」；点击绿色的「已连时长」胶囊即可在 <code>分钟 → 小时 → 天</code> 之间循环切换。</div>
+        <div class="guide-step"><strong>3. 一键断网与定时断网：</strong>点「断网」立即切断全部国内和代理流量；点「定时 ▾」可设置断网几分钟或几小时，倒计时结束自动恢复联网；点「恢复联网」可随时提前放行。</div>
+        <div class="guide-step"><strong>4. 防锁死保护：</strong>将您常用的电脑设为「白名单」，它不会占用手机并发名额，也永远不会被误断网。</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 实时审计与 nftables 规则弹窗 -->
+  <div id="audit-modal" class="overlay hidden">
+    <div class="panel modal-card modal-wide">
+      <div class="modal-head">
+        <div>
+          <h3>实时操作日志 &amp; nftables 防绕过规则</h3>
+          <p class="muted-hint">包含防火墙集合同步、conntrack -D 断流、定时到期自动恢复记录</p>
+        </div>
+        <div class="modal-head-actions">
+          <button id="btn-switch-audit" type="button" class="btn btn-primary btn-xs">操作日志</button>
+          <button id="btn-switch-script" type="button" class="btn btn-ghost btn-xs">nftables 脚本</button>
+          <button id="btn-audit-close" type="button" class="btn btn-ghost btn-xs">关闭</button>
+        </div>
+      </div>
+      <div id="audit-pane" class="audit-list"></div>
+      <div id="script-pane" class="hidden">
+        <div class="script-toolbar">
+          <span class="muted-hint">当前核心防护规则：<strong id="script-rule-count">0</strong> 条</span>
+          <button id="btn-copy-script" type="button" class="btn btn-ghost btn-xs">复制完整脚本</button>
+        </div>
+        <pre id="script-content" class="code-viewer"></pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- 系统设置弹窗 -->
+  <div id="settings-modal" class="overlay hidden">
+    <div class="panel modal-card">
+      <div class="modal-head">
+        <h3>系统设置</h3>
+        <button id="btn-settings-close" type="button" class="btn btn-ghost btn-xs">关闭</button>
+      </div>
+      <form id="settings-form" class="modal-form">
+        <div class="form-row">
+          <label class="field-label" for="set-max-devices">最大同时在线授权设备数（不含白名单）</label>
+          <input id="set-max-devices" type="number" min="1" max="256" class="input" required />
+        </div>
+        <div class="form-row">
+          <label class="field-label" for="set-portal-title">手机认证页标题</label>
+          <input id="set-portal-title" type="text" class="input" maxlength="40" required />
+        </div>
+        <div class="form-row">
+          <label class="field-label" for="set-tunnel-token">Cloudflare Tunnel Token（可选，用于固定域名）</label>
+          <input id="set-tunnel-token" type="password" class="input" placeholder="留空表示保持原有 Token 不变" />
+          <p id="set-token-status" class="muted-hint"></p>
+        </div>
+        <div class="form-row">
+          <label class="field-label" for="set-new-password">修改管理员密码（可选）</label>
+          <input id="set-new-password" type="password" class="input" placeholder="至少 4 位；不修改请留空" />
+        </div>
+        <label class="checkbox-row">
+          <input id="set-allow-ports" type="checkbox" />
+          <span>防锁死兜底：放行 LAN 访问网关 SSH (22) 与管理端口</span>
+        </label>
+        <div class="modal-foot">
+          <button type="button" id="btn-settings-cancel" class="btn btn-ghost">取消</button>
+          <button type="submit" class="btn btn-primary">保存设置</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="toast-container" class="toast-container"></div>
+  <script src="/dashboard.js"></script>
+</body>
+</html>

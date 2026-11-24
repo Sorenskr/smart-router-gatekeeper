@@ -1,0 +1,6 @@
+.toolchain/
+dist/
+data/
+*.exe
+*.log
+__pycache__/
