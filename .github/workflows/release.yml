@@ -39,12 +39,11 @@ jobs:
           GOOS=linux GOARCH=arm64 go vet ./...
           go test -v ./...
 
-      - name: Cross-Compile Binaries
+      - name: Cross-Compile Binaries (Windows & ImmortalWrt ARM64)
         run: |
           mkdir -p dist
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o dist/gatekeeper-linux-arm64 .
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/gatekeeper-windows-amd64.exe .
-          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o dist/gatekeeper-macos-arm64 .
 
       - name: Package Portable Windows Kit
         run: |
@@ -52,7 +51,6 @@ jobs:
           cp dist/gatekeeper-windows-amd64.exe kit/dist/
           cp dist/gatekeeper-linux-arm64 kit/dist/
           cp scripts/deploy_to_immortalwrt.ps1 kit/scripts/
-          cp scripts/deploy_to_immortalwrt.sh kit/scripts/
           cp 双击启动-本地模拟体验.bat kit/
           cp 双击部署-一键安装到软路由.bat kit/
           cp README.md kit/
@@ -65,14 +63,12 @@ jobs:
         with:
           generate_release_notes: true
           body: |
-            ## Smart Router Gatekeeper 开箱即用下载包
+            ## Smart Router Gatekeeper (Windows + ImmortalWrt ARM64)
 
-            - **任意 Windows 电脑一键上手包**：下载 `SmartRouterGatekeeper-Windows-Kit.zip` 解压，直接双击 `双击部署-一键安装到软路由.bat` 或 `双击启动-本地模拟体验.bat`（无需安装 Go 或任何开发软件）。
-            - **ImmortalWrt / OpenWrt (`aarch64`) 独立单文件**：`gatekeeper-linux-arm64`
-            - **Windows 本地控制台/仿真程序**：`gatekeeper-windows-amd64.exe`
-            - **macOS Apple Silicon 程序**：`gatekeeper-macos-arm64`
+            - **任意 Windows 电脑一键上手包（推荐）**：下载 `SmartRouterGatekeeper-Windows-Kit.zip` 解压，直接双击 `双击部署-一键安装到软路由.bat` 或 `双击启动-本地模拟体验.bat`（无需安装任何开发软件，全程免 `yes` 确认）。
+            - **ImmortalWrt / OpenWrt (`aarch64`) 单文件**：`gatekeeper-linux-arm64`
+            - **Windows 本地仿真程序**：`gatekeeper-windows-amd64.exe`
           files: |
             dist/SmartRouterGatekeeper-Windows-Kit.zip
             dist/gatekeeper-linux-arm64
             dist/gatekeeper-windows-amd64.exe
-            dist/gatekeeper-macos-arm64

@@ -7,16 +7,27 @@ param(
     [int]$PortalPort = 8089,
     [int]$DNSPort = 5354,
     [string]$Password = "admin123",
+    [string]$SshPassword = "",
     [string]$LanIface = "br-lan",
     [ValidateSet("quick", "token", "none")]
     [string]$TunnelMode = "quick",
     [string]$TunnelToken = "",
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [switch]$NonInteractive
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $armBin = Join-Path $root 'dist\gatekeeper-linux-arm64'
+
+if ([string]::IsNullOrEmpty($SshPassword) -and -not [string]::IsNullOrEmpty($env:GK_SSH_PASS_INPUT)) {
+    $SshPassword = $env:GK_SSH_PASS_INPUT
+}
+Remove-Item Env:GK_SSH_PASS_INPUT -ErrorAction SilentlyContinue
+
+if ([string]::IsNullOrEmpty($SshPassword) -and -not $NonInteractive) {
+    $SshPassword = Read-Host "请输入软路由 SSH ($User) 登录密码（留空则由 OpenSSH 弹窗/键盘输入）"
+}
 
 if (-not $SkipBuild -or -not (Test-Path $armBin)) {
     Write-Output ">>> 步骤 1/4: 编译最新 linux/arm64 静态二进制文件..."
@@ -24,15 +35,68 @@ if (-not $SkipBuild -or -not (Test-Path $armBin)) {
 }
 
 if (-not (Test-Path $armBin)) {
-    throw "未找到二进制文件: $armBin"
+    throw "未找到软路由程序文件: $armBin"
 }
 
-$target = "${User}@${RouterIP}"
-Write-Output "`n>>> 步骤 2/4: 上传单文件程序到 ImmortalWrt (${target})..."
-& scp -P $SshPort $armBin "${target}:/tmp/gatekeeper.new"
-if ($LASTEXITCODE -ne 0) { throw "SCP 上传失败，请确认 SSH 连通性与密码/密钥" }
+$sshVerRaw = (& ssh -V 2>&1) -join ' '
+$sshMajor = 0
+$sshMinor = 0
+if ($sshVerRaw -match 'OpenSSH_for_Windows_(\d+)\.(\d+)|OpenSSH_(\d+)\.(\d+)') {
+    if ($Matches[1]) {
+        $sshMajor = [int]$Matches[1]
+        $sshMinor = [int]$Matches[2]
+    } elseif ($Matches[3]) {
+        $sshMajor = [int]$Matches[3]
+        $sshMinor = [int]$Matches[4]
+    }
+}
 
-$remoteScript = @'
+$commonSshOpts = @(
+    '-o', 'StrictHostKeyChecking=no',
+    '-o', 'UserKnownHostsFile=NUL',
+    '-o', 'ConnectTimeout=10',
+    '-o', 'LogLevel=ERROR'
+)
+$scpOpts = @() + $commonSshOpts
+if ($sshMajor -ge 9) {
+    # OpenSSH 9+ 默认使用 SFTP，补充 -O 强制走传统 SCP 协议以兼容 ImmortalWrt Dropbear
+    $scpOpts += '-O'
+}
+
+$useAskPass = ($SshPassword -ne '') -and (($sshMajor -gt 8) -or ($sshMajor -eq 8 -and $sshMinor -ge 4))
+$askCmd = $null
+$prevAskPass = $env:SSH_ASKPASS
+$prevAskReq = $env:SSH_ASKPASS_REQUIRE
+$prevDisplay = $env:DISPLAY
+
+try {
+    if ($useAskPass) {
+        $askCmd = Join-Path $env:TEMP ("gk_askpass_" + [Guid]::NewGuid().ToString("N") + ".cmd")
+        $cmdLine = '@powershell -NoProfile -Command "[Console]::WriteLine($env:GK_SSH_PASS)"'
+        [System.IO.File]::WriteAllText($askCmd, $cmdLine + "`r`n", [System.Text.Encoding]::ASCII)
+
+        $askPath = $askCmd
+        try {
+            $fso = New-Object -ComObject Scripting.FileSystemObject
+            $askPath = $fso.GetFile($askCmd).ShortPath
+        } catch {
+            $askPath = $askCmd
+        }
+
+        $env:GK_SSH_PASS = $SshPassword
+        $env:SSH_ASKPASS = $askPath
+        $env:SSH_ASKPASS_REQUIRE = 'force'
+        $env:DISPLAY = '1'
+    }
+
+    $target = "${User}@${RouterIP}"
+    Write-Output "`n>>> 步骤 2/4: 上传单文件程序到 ImmortalWrt (${target})..."
+    & scp @scpOpts -P $SshPort $armBin "${target}:/tmp/gatekeeper.new"
+    if ($LASTEXITCODE -ne 0) {
+        throw "SCP 上传失败！请检查：1) 电脑是否已连接软路由网络；2) 软路由 IP (${RouterIP}) 是否正确；3) SSH 账号(${User})与密码是否正确。"
+    }
+
+    $remoteScript = @'
 set -eu
 ROUTER_IP="__ROUTER_IP__"
 ADMIN_PORT="__ADMIN_PORT__"
@@ -158,27 +222,39 @@ if [ "$TUNNEL_MODE" != "none" ] && command -v cloudflared >/dev/null 2>&1 && com
   if [ -n "$PUBLIC_URL" ]; then
     echo " 全球外网访问地址: ${PUBLIC_URL}"
   else
-    echo " 全球外网隧道正在后台建立中，请在管理大屏顶部 Cloudflare Tunnel 面板查看地址。"
+    echo " 全球外网隧道正在后台建立中，请在管理大屏顶部「远程访问」面板查看地址。"
   fi
 elif [ "$TUNNEL_MODE" != "none" ]; then
-  echo " 提示: 未检测到 cloudflared，您可在管理大屏登录或手动上传 cloudflared-linux-arm64 后点击「一键开启外网控制」。"
+  echo " 提示: 未检测到 cloudflared，您可在管理大屏登录后点击「远程访问」按提示安装并开启。"
 fi
 '@
 
-$remoteScript = $remoteScript.
-    Replace("__ROUTER_IP__", $RouterIP).
-    Replace("__ADMIN_PORT__", "$AdminPort").
-    Replace("__PORTAL_PORT__", "$PortalPort").
-    Replace("__DNS_PORT__", "$DNSPort").
-    Replace("__PASSWORD__", $Password).
-    Replace("__LAN_IFACE__", $LanIface).
-    Replace("__TUNNEL_MODE__", $TunnelMode).
-    Replace("__TUNNEL_TOKEN__", $TunnelToken).
-    Replace("`r`n", "`n")
+    $remoteScript = $remoteScript.
+        Replace("__ROUTER_IP__", $RouterIP).
+        Replace("__ADMIN_PORT__", "$AdminPort").
+        Replace("__PORTAL_PORT__", "$PortalPort").
+        Replace("__DNS_PORT__", "$DNSPort").
+        Replace("__PASSWORD__", $Password).
+        Replace("__LAN_IFACE__", $LanIface).
+        Replace("__TUNNEL_MODE__", $TunnelMode).
+        Replace("__TUNNEL_TOKEN__", $TunnelToken).
+        Replace("`r`n", "`n")
 
-Write-Output "`n>>> 步骤 3/4: 在 ImmortalWrt 配置 procd 开机自启、防锁死白名单与 nftables..."
-$remoteB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($remoteScript))
-& ssh -p $SshPort $target "echo '$remoteB64' | base64 -d | sh"
-if ($LASTEXITCODE -ne 0) { throw "远程初始化脚本执行失败" }
+    Write-Output "`n>>> 步骤 3/4: 在 ImmortalWrt 配置 procd 开机自启、防锁死白名单与 nftables..."
+    $remoteB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($remoteScript))
+    & ssh @commonSshOpts -p $SshPort $target "echo '$remoteB64' | base64 -d | sh"
+    if ($LASTEXITCODE -ne 0) {
+        throw "远程初始化脚本执行失败，请检查 SSH 密码或路由磁盘空间"
+    }
 
-Write-Output "`n>>> 步骤 4/4: 全部部署流程已完成！"
+    Write-Output "`n>>> 步骤 4/4: 全部部署流程已完成！"
+}
+finally {
+    if ($askCmd -and (Test-Path $askCmd)) {
+        Remove-Item $askCmd -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item Env:GK_SSH_PASS -ErrorAction SilentlyContinue
+    if ($null -ne $prevAskPass) { $env:SSH_ASKPASS = $prevAskPass } else { Remove-Item Env:SSH_ASKPASS -ErrorAction SilentlyContinue }
+    if ($null -ne $prevAskReq) { $env:SSH_ASKPASS_REQUIRE = $prevAskReq } else { Remove-Item Env:SSH_ASKPASS_REQUIRE -ErrorAction SilentlyContinue }
+    if ($null -ne $prevDisplay) { $env:DISPLAY = $prevDisplay } else { Remove-Item Env:DISPLAY -ErrorAction SilentlyContinue }
+}
