@@ -24,6 +24,7 @@ type Client struct {
 	reader  *bufio.Reader
 	writeMu sync.Mutex
 	closed  bool
+	done    chan struct{}
 	onClose func(*Client)
 }
 
@@ -66,6 +67,7 @@ func Upgrade(w http.ResponseWriter, r *http.Request, onClose func(*Client)) (*Cl
 	client := &Client{
 		conn:    conn,
 		reader:  bufrw.Reader,
+		done:    make(chan struct{}),
 		onClose: onClose,
 	}
 	go client.readLoop()
@@ -82,7 +84,7 @@ func (c *Client) SendJSON(v any) error {
 	return c.writeFrame(0x1, payload)
 }
 
-// Close 主动关闭连接。
+// Close 主动关闭连接并立即唤醒终止心跳协程。
 func (c *Client) Close() {
 	c.writeMu.Lock()
 	if c.closed {
@@ -90,6 +92,7 @@ func (c *Client) Close() {
 		return
 	}
 	c.closed = true
+	close(c.done)
 	_ = c.writeFrameRaw(0x8, nil)
 	_ = c.conn.Close()
 	c.writeMu.Unlock()
@@ -109,7 +112,7 @@ func (c *Client) writeFrame(opcode byte, payload []byte) error {
 }
 
 func (c *Client) writeFrameRaw(opcode byte, payload []byte) error {
-	_ = c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	_ = c.conn.SetWriteDeadline(time.Now().Add(4 * time.Second))
 	header := make([]byte, 0, 10)
 	header = append(header, 0x80|opcode)
 	n := len(payload)
@@ -138,10 +141,15 @@ func (c *Client) writeFrameRaw(opcode byte, payload []byte) error {
 func (c *Client) pingLoop() {
 	ticker := time.NewTicker(25 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		if err := c.writeFrame(0x9, []byte("ping")); err != nil {
-			c.Close()
+	for {
+		select {
+		case <-c.done:
 			return
+		case <-ticker.C:
+			if err := c.writeFrame(0x9, []byte("ping")); err != nil {
+				c.Close()
+				return
+			}
 		}
 	}
 }

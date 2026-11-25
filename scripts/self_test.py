@@ -64,7 +64,7 @@ def http_probe(url):
         resp = opener.open(url, timeout=5)
         return resp.status, resp.headers.get("Location", ""), resp.read().decode("utf-8", errors="ignore")
     except urllib.error.HTTPError as e:
-        return e.code, e.headers.get("Location", ""), ""
+        return e.code, e.headers.get("Location", ""), e.read().decode("utf-8", errors="ignore")
 
 
 def ws_connect_and_read_one(host, port, path):
@@ -230,7 +230,7 @@ def main():
         assert code == 200 and paused["device"]["status"] == "paused"
 
         code, p_status = http_json(f"{PORTAL_BASE}/api/portal/status?mac={new_mac}")
-        assert code == 200 and p_status["status"] == "paused" and "暂停" in p_status["message"]
+        assert code == 200 and p_status["status"] == "paused" and "软路由已断网" in p_status["message"], f"断网提示文案不符: {p_status}"
 
         # 验证门户探针未放行返回 302 跳转
         probe_code, probe_loc, _ = http_probe(f"{PORTAL_BASE}/generate_204?mac={new_mac}")
@@ -344,7 +344,39 @@ def main():
             f"测试 6 重启后定时断网倒计时未持久化: {devs3[new_mac]}"
         print("[通过] 测试 6：定时断网自动恢复、手动提前恢复与重启倒计时持久化全部通过")
 
-        print("\n>>> 全部 6 项自动化端到端验收测试 100% 通过！")
+        # 测试 7：被断网手机 reason=paused 提示 & 准入管控总开关关闭/恢复自由放行
+        token3 = login3["token"]
+        probe_paused, loc_paused, body_paused = http_probe(f"{PORTAL_BASE}/generate_204?mac={new_mac}")
+        assert probe_paused == 302 and "reason=paused" in (loc_paused or ""), f"断网探针应重定向带 reason=paused: {probe_paused} {loc_paused}"
+        assert "软路由已断网" in body_paused, "断网探针响应体应包含中文提示"
+
+        code, p_paused = http_json(f"{PORTAL_BASE}/api/portal/status?mac={new_mac}")
+        assert code == 200 and p_paused.get("gatekeeper_enabled") is True and "软路由已断网" in p_paused.get("message", ""), f"断网状态提示异常: {p_paused}"
+        assert snap3.get("generated_at"), "快照应包含服务端校准时间戳 generated_at"
+
+        # 关闭总开关 -> 已断网设备与新设备均直接 204 自由放行
+        code, off_res = http_json(f"{ADMIN_BASE}/api/settings", "PUT", {"gatekeeper_enabled": False}, token3)
+        assert code == 200 and off_res["settings"]["gatekeeper_enabled"] is False, f"关闭总开关失败: {off_res}"
+
+        probe_bypass_paused, _, _ = http_probe(f"{PORTAL_BASE}/generate_204?mac={new_mac}")
+        assert probe_bypass_paused == 204, f"总开关关闭后已断网设备也应直接 204 放行，实际 {probe_bypass_paused}"
+        probe_bypass_new, _, _ = http_probe(f"{PORTAL_BASE}/generate_204?mac=aa:bb:cc:99:88:77")
+        assert probe_bypass_new == 204, f"总开关关闭后新设备应免填昵称直接 204 放行，实际 {probe_bypass_new}"
+
+        code, p_off = http_json(f"{PORTAL_BASE}/api/portal/status?mac={new_mac}")
+        assert code == 200 and p_off.get("gatekeeper_enabled") is False, f"门户接口未反映总开关关闭: {p_off}"
+
+        code, fw_off = http_json(f"{ADMIN_BASE}/api/firewall/script", "GET", None, token3)
+        assert code == 200 and "直接放行" in fw_off.get("script", "") and fw_off.get("rules_count") == 0, f"总开关关闭后防火墙脚本应切换为直接放行: {fw_off}"
+
+        # 重新开启总开关 -> 恢复拦截
+        code, on_res = http_json(f"{ADMIN_BASE}/api/settings", "PUT", {"gatekeeper_enabled": True}, token3)
+        assert code == 200 and on_res["settings"]["gatekeeper_enabled"] is True, f"开启总开关失败: {on_res}"
+        probe_restored, loc_restored, _ = http_probe(f"{PORTAL_BASE}/generate_204?mac={new_mac}")
+        assert probe_restored == 302 and "reason=paused" in (loc_restored or ""), f"总开关重新开启后应恢复断网拦截: {probe_restored} {loc_restored}"
+        print("[通过] 测试 7：断网手机「软路由已断网」告警、准入总开关自由放行与重新拦截全部通过")
+
+        print("\n>>> 全部 7 项自动化端到端验收测试 100% 通过！")
     finally:
         stop_proc(proc)
         shutil.rmtree(temp_dir, ignore_errors=True)

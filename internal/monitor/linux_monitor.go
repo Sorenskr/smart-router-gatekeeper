@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gatekeeper/internal/firewall"
@@ -36,7 +37,8 @@ type LinuxMonitor struct {
 	prevByIP     map[string]prevCounters
 	ipToMAC      map[string]string
 	onUpdate     func()
-	hasCloudflared bool
+	httpClient   *http.Client
+	probing      atomic.Bool
 }
 
 // NewLinuxMonitor 创建真实软路由网络监控器。
@@ -44,15 +46,15 @@ func NewLinuxMonitor(st *store.Store, fw firewall.Manager, adminPort, portalPort
 	settings := st.GetSettings()
 	_, cfErr := exec.LookPath("cloudflared")
 	return &LinuxMonitor{
-		store:          st,
-		fw:             fw,
-		adminPort:      adminPort,
-		portalPort:     portalPort,
-		dnsPort:        dnsPort,
-		prevByIP:       make(map[string]prevCounters),
-		ipToMAC:        make(map[string]string),
-		onUpdate:       onUpdate,
-		hasCloudflared: cfErr == nil,
+		store:      st,
+		fw:         fw,
+		adminPort:  adminPort,
+		portalPort: portalPort,
+		dnsPort:    dnsPort,
+		prevByIP:   make(map[string]prevCounters),
+		ipToMAC:    make(map[string]string),
+		onUpdate:   onUpdate,
+		httpClient: &http.Client{Timeout: 3 * time.Second},
 		health: model.SystemHealth{
 			RouterOnline:         true,
 			MockMode:             false,
@@ -67,28 +69,40 @@ func NewLinuxMonitor(st *store.Store, fw firewall.Manager, adminPort, portalPort
 }
 
 func (m *LinuxMonitor) Start(ctx context.Context) {
+	m.slowCheck()
 	m.sampleAll()
-	m.probeConnectivity()
+	go m.probeConnectivityAsync()
 
 	fastTicker := time.NewTicker(2 * time.Second)
-	probeTicker := time.NewTicker(10 * time.Second)
+	slowTicker := time.NewTicker(10 * time.Second)
 	defer fastTicker.Stop()
-	defer probeTicker.Stop()
+	defer slowTicker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-fastTicker.C:
-			_ = m.fw.EnsureHealthy()
 			m.sampleAll()
 			if m.onUpdate != nil {
 				m.onUpdate()
 			}
-		case <-probeTicker.C:
-			m.probeConnectivity()
+		case <-slowTicker.C:
+			m.slowCheck()
+			go m.probeConnectivityAsync()
 		}
 	}
+}
+
+func (m *LinuxMonitor) slowCheck() {
+	_ = m.fw.EnsureHealthy()
+	passwall := detectPasswall()
+	_, cfErr := exec.LookPath("cloudflared")
+
+	m.mu.Lock()
+	m.health.PasswallActive = passwall
+	m.health.CloudflaredInstalled = cfErr == nil
+	m.mu.Unlock()
 }
 
 func (m *LinuxMonitor) Health() model.SystemHealth {
@@ -196,11 +210,17 @@ func (m *LinuxMonitor) sampleAll() {
 		observations = append(observations, obs)
 	}
 
-	m.store.SyncObservations(observations)
+	// 定期清理长时间未出现的旧 IP 计数器，防止内存泄漏
+	for ip, prev := range m.prevByIP {
+		if _, active := ip2mac[ip]; !active && now.Sub(prev.ts) > 5*time.Minute {
+			delete(m.prevByIP, ip)
+		}
+	}
+
+	m.store.SyncObservations(observations, true)
 
 	nftActive, ctAvail, ruleCount := m.fw.Status()
 	uptime, load, memPct := readLinuxSystemMetrics()
-	passwall := detectPasswall()
 
 	m.mu.Lock()
 	m.ipToMAC = ip2mac
@@ -210,18 +230,35 @@ func (m *LinuxMonitor) sampleAll() {
 	m.health.UptimeSec = uptime
 	m.health.CPULoad = load
 	m.health.MemUsedPercent = memPct
-	m.health.PasswallActive = passwall
 	m.health.NFTablesActive = nftActive
 	m.health.ConntrackAvailable = ctAvail
 	m.health.FirewallRulesCount = ruleCount
-	_, cfErr := exec.LookPath("cloudflared")
-	m.health.CloudflaredInstalled = cfErr == nil
 	m.mu.Unlock()
 }
 
-func (m *LinuxMonitor) probeConnectivity() {
-	domOK, domMs := probeTCP("223.5.5.5:53", 2*time.Second)
-	proxyOK, proxyMs := probeHTTP204("https://www.gstatic.com/generate_204", 3*time.Second)
+func (m *LinuxMonitor) probeConnectivityAsync() {
+	if !m.probing.CompareAndSwap(false, true) {
+		return
+	}
+	defer m.probing.Store(false)
+
+	var (
+		domOK   bool
+		domMs   int64
+		proxyOK bool
+		proxyMs int64
+		wg      sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		domOK, domMs = probeTCP("223.5.5.5:53", 2*time.Second)
+	}()
+	go func() {
+		defer wg.Done()
+		proxyOK, proxyMs = m.probeHTTP204("https://www.gstatic.com/generate_204")
+	}()
+	wg.Wait()
 
 	m.mu.Lock()
 	m.health.DomesticReachable = domOK
@@ -284,11 +321,13 @@ func readARPAndNeigh(lanIface string) []neighEntry {
 		}
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 	args := []string{"neigh", "show"}
 	if lanIface != "" {
 		args = append(args, "dev", lanIface)
 	}
-	if out, err := exec.Command("ip", args...).Output(); err == nil {
+	if out, err := exec.CommandContext(ctx, "ip", args...).Output(); err == nil {
 		for _, line := range strings.Split(string(out), "\n") {
 			fields := strings.Fields(line)
 			if len(fields) < 4 {
@@ -341,10 +380,17 @@ func readConntrackStats() map[string]ipConnStats {
 	out := make(map[string]ipConnStats)
 	raw, err := os.ReadFile("/proc/net/nf_conntrack")
 	if err != nil {
-		return out
+		// 部分新内核关闭 /proc/net/nf_conntrack，回退尝试 conntrack CLI
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		cmdOut, cErr := exec.CommandContext(ctx, "conntrack", "-L").Output()
+		if cErr != nil {
+			return out
+		}
+		raw = cmdOut
 	}
 	for _, line := range strings.Split(string(raw), "\n") {
-		if !strings.Contains(line, "ipv4") {
+		if line == "" {
 			continue
 		}
 		fields := strings.Fields(line)
@@ -416,12 +462,16 @@ func readLinuxSystemMetrics() (int64, string, float64) {
 }
 
 func detectPasswall() bool {
-	if _, err := os.Stat("/etc/config/passwall"); err == nil {
-		if out, pErr := exec.Command("sh", "-c", "ps w | grep -E 'passwall|sing-box|xray|chinadns' | grep -v grep").Output(); pErr == nil {
-			return len(strings.TrimSpace(string(out))) > 0
-		}
+	if _, err := os.Stat("/etc/config/passwall"); err != nil {
+		return false
 	}
-	return false
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "sh", "-c", "ps w | grep -E 'passwall|sing-box|xray|chinadns' | grep -v grep").Output()
+	if err != nil {
+		return false
+	}
+	return len(strings.TrimSpace(string(out))) > 0
 }
 
 func probeTCP(addr string, timeout time.Duration) (bool, int64) {
@@ -434,10 +484,9 @@ func probeTCP(addr string, timeout time.Duration) (bool, int64) {
 	return true, time.Since(start).Milliseconds()
 }
 
-func probeHTTP204(rawURL string, timeout time.Duration) (bool, int64) {
-	client := &http.Client{Timeout: timeout}
+func (m *LinuxMonitor) probeHTTP204(rawURL string) (bool, int64) {
 	start := time.Now()
-	resp, err := client.Get(rawURL)
+	resp, err := m.httpClient.Get(rawURL)
 	if err != nil {
 		return false, 0
 	}

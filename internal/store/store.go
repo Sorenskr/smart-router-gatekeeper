@@ -59,6 +59,7 @@ func NewStore(dataDir string, mockMode bool, defaultPassword, routerIP, lanIface
 		defaultPassword = "admin123"
 	}
 
+	defaultEnabled := true
 	s := &Store{
 		filePath: filepath.Join(dataDir, "state.json"),
 		mockMode: mockMode,
@@ -67,6 +68,7 @@ func NewStore(dataDir string, mockMode bool, defaultPassword, routerIP, lanIface
 			Version: 1,
 			Settings: model.Settings{
 				MaxConcurrentDevices: 2,
+				GatekeeperEnabled:    &defaultEnabled,
 				RouterIP:             routerIP,
 				LanIface:             lanIface,
 				PortalTitle:          "智慧网络准入认证",
@@ -96,6 +98,10 @@ func NewStore(dataDir string, mockMode bool, defaultPassword, routerIP, lanIface
 	}
 	if s.state.Settings.MaxConcurrentDevices <= 0 {
 		s.state.Settings.MaxConcurrentDevices = 2
+	}
+	if s.state.Settings.GatekeeperEnabled == nil {
+		enabled := true
+		s.state.Settings.GatekeeperEnabled = &enabled
 	}
 	if strings.TrimSpace(s.state.Settings.RouterIP) == "" {
 		s.state.Settings.RouterIP = routerIP
@@ -419,10 +425,21 @@ func (s *Store) ValidateSession(token string) bool {
 	return true
 }
 
-// RevokeSession 销毁会话 Token。
+// RevokeSession 销毁指定会话 Token。
 func (s *Store) RevokeSession(token string) {
 	s.mu.Lock()
 	delete(s.sessions, token)
+	s.mu.Unlock()
+}
+
+// RevokeOtherSessions 在修改管理员密码等敏感操作后，立即吊销除 keepToken 外的全部旧会话。
+func (s *Store) RevokeOtherSessions(keepToken string) {
+	s.mu.Lock()
+	for tok := range s.sessions {
+		if tok != keepToken {
+			delete(s.sessions, tok)
+		}
+	}
 	s.mu.Unlock()
 }
 
@@ -524,8 +541,8 @@ func (s *Store) ApplyPortalRequest(mac, ip, hostname, requestedName string) (mod
 	return dev, newlyPending, nil
 }
 
-// EnsureObservedDevice 在发现新局域网设备时注册为 unregistered，或更新在线观察指标。
-func (s *Store) SyncObservations(obs []model.LiveDeviceObservation) bool {
+// SyncObservations 在发现新局域网设备时注册为 unregistered，更新在线观察指标；真实路由模式下自动将超时消失设备置为离线。
+func (s *Store) SyncObservations(obs []model.LiveDeviceObservation, markMissingOffline bool) bool {
 	now := time.Now()
 	obsMap := make(map[string]model.LiveDeviceObservation, len(obs))
 	for _, o := range obs {
@@ -598,6 +615,22 @@ func (s *Store) SyncObservations(obs []model.LiveDeviceObservation) bool {
 		}
 		dev.DisplayName = dev.ComputeDisplayName()
 		s.state.Devices[mac] = dev
+	}
+
+	if markMissingOffline {
+		for mac, dev := range s.state.Devices {
+			if _, seen := obsMap[mac]; seen {
+				continue
+			}
+			if dev.Online && now.Sub(dev.LastSeenAt) > 30*time.Second {
+				dev.Online = false
+				dev.RxRateBps = 0
+				dev.TxRateBps = 0
+				dev.ActiveConns = 0
+				s.state.Devices[mac] = dev
+				changed = true
+			}
+		}
 	}
 
 	// 仅在有新设备或在线状态发生变化时落盘，避免每 2 秒无意义写 Flash。
@@ -1048,6 +1081,7 @@ func (s *Store) DeleteDevice(mac string) error {
 // SettingsUpdate 描述可修改的系统配置字段。
 type SettingsUpdate struct {
 	MaxConcurrentDevices *int    `json:"max_concurrent_devices,omitempty"`
+	GatekeeperEnabled    *bool   `json:"gatekeeper_enabled,omitempty"`
 	PortalTitle          *string `json:"portal_title,omitempty"`
 	TunnelToken          *string `json:"tunnel_token,omitempty"`
 	SoundEnabled         *bool   `json:"sound_enabled,omitempty"`
@@ -1058,6 +1092,18 @@ type SettingsUpdate struct {
 // UpdateSettings 修改系统设置并原子持久化。
 func (s *Store) UpdateSettings(u SettingsUpdate) (model.SettingsView, error) {
 	s.mu.Lock()
+	if u.GatekeeperEnabled != nil {
+		old := s.isGatekeeperEnabledLocked()
+		v := *u.GatekeeperEnabled
+		s.state.Settings.GatekeeperEnabled = &v
+		if old != v {
+			if v {
+				s.addAuditLocked("system", "开启准入认证总开关", "GLOBAL", "已恢复设备准入审批、并发上限锁与断网拦截规则")
+			} else {
+				s.addAuditLocked("system", "关闭准入认证总开关", "GLOBAL", "已切换为全网自由直通模式：所有设备免填昵称直接上网")
+			}
+		}
+	}
 	if u.MaxConcurrentDevices != nil {
 		if *u.MaxConcurrentDevices < 1 || *u.MaxConcurrentDevices > 256 {
 			s.mu.Unlock()
@@ -1107,6 +1153,20 @@ func (s *Store) UpdateSettings(u SettingsUpdate) (model.SettingsView, error) {
 	return view, nil
 }
 
+func (s *Store) isGatekeeperEnabledLocked() bool {
+	if s.state.Settings.GatekeeperEnabled == nil {
+		return true
+	}
+	return *s.state.Settings.GatekeeperEnabled
+}
+
+// IsGatekeeperEnabled 返回准入认证总开关当前是否开启。
+func (s *Store) IsGatekeeperEnabled() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.isGatekeeperEnabledLocked()
+}
+
 func (s *Store) settingsViewLocked() model.SettingsView {
 	tok := s.state.Settings.TunnelToken
 	masked := ""
@@ -1119,6 +1179,7 @@ func (s *Store) settingsViewLocked() model.SettingsView {
 	}
 	return model.SettingsView{
 		MaxConcurrentDevices: s.state.Settings.MaxConcurrentDevices,
+		GatekeeperEnabled:    s.isGatekeeperEnabledLocked(),
 		RouterIP:             s.state.Settings.RouterIP,
 		LanIface:             s.state.Settings.LanIface,
 		PortalTitle:          s.state.Settings.PortalTitle,
@@ -1241,42 +1302,55 @@ func (s *Store) GetPortalStatus(mac, ip string) model.PortalStatus {
 	defer s.mu.RUnlock()
 
 	portalTitle := s.state.Settings.PortalTitle
+	gkEnabled := s.isGatekeeperEnabledLocked()
 	if err != nil {
+		msg := "未识别到设备 MAC，请在下方填写姓名/代号提交接入申请"
+		if !gkEnabled {
+			msg = "准入管控已关闭，当前为自由直通模式，无需填写昵称即可上网"
+		}
 		return model.PortalStatus{
-			IP:          ip,
-			Status:      model.StatusUnregistered,
-			PortalTitle: portalTitle,
-			MockMode:    s.mockMode,
-			Message:     "未识别到设备 MAC，请在下方填写姓名/代号提交接入申请",
+			IP:                ip,
+			Status:            model.StatusUnregistered,
+			GatekeeperEnabled: gkEnabled,
+			PortalTitle:       portalTitle,
+			MockMode:          s.mockMode,
+			Message:           msg,
 		}
 	}
 
 	dev, ok := s.state.Devices[normMAC]
 	if !ok {
+		msg := "请输入使用者姓名或设备专属代号以申请联网"
+		if !gkEnabled {
+			msg = "准入管控已关闭，当前为自由直通模式，无需填写昵称即可上网"
+		}
 		return model.PortalStatus{
-			MAC:         normMAC,
-			IP:          ip,
-			DisplayName: normMAC,
-			Status:      model.StatusUnregistered,
-			PortalTitle: portalTitle,
-			MockMode:    s.mockMode,
-			Online:      true,
-			Message:     "请输入使用者姓名或设备专属代号以申请联网",
+			MAC:               normMAC,
+			IP:                ip,
+			DisplayName:       normMAC,
+			Status:            model.StatusUnregistered,
+			GatekeeperEnabled: gkEnabled,
+			PortalTitle:       portalTitle,
+			MockMode:          s.mockMode,
+			Online:            true,
+			Message:           msg,
 		}
 	}
 
 	pauseRem := computePauseRemainingSec(dev, now)
 	msg := "请输入使用者姓名或设备专属代号以申请联网"
 	switch {
+	case !gkEnabled:
+		msg = "准入管控已关闭，当前为自由直通模式，无需填写昵称即可上网"
 	case dev.IsWhitelist || dev.Status == model.StatusApproved:
 		msg = "已授权联网，全速网络权限已放行"
 	case dev.Status == model.StatusPending:
 		msg = "等待管理员审批中..."
 	case dev.Status == model.StatusPaused:
 		if pauseRem > 0 {
-			msg = fmt.Sprintf("您的连接已被管理员暂停，预计 %s 后自动恢复", formatDurationZh(time.Duration(pauseRem)*time.Second))
+			msg = fmt.Sprintf("软路由已断网，预计 %s 后自动恢复", formatDurationZh(time.Duration(pauseRem)*time.Second))
 		} else {
-			msg = "您的连接已被管理员暂停，请联系开启"
+			msg = "软路由已断网，请联系管理员恢复联网"
 		}
 	}
 
@@ -1289,6 +1363,7 @@ func (s *Store) GetPortalStatus(mac, ip string) model.PortalStatus {
 		IP:                displayIP,
 		Hostname:          dev.Hostname,
 		Status:            dev.Status,
+		GatekeeperEnabled: gkEnabled,
 		RequestedName:     dev.RequestedName,
 		AdminRemark:       dev.AdminRemark,
 		DisplayName:       dev.ComputeDisplayName(),
@@ -1305,10 +1380,13 @@ func (s *Store) GetPortalStatus(mac, ip string) model.PortalStatus {
 	}
 }
 
-// IsDeviceAllowed 判断给定 MAC 或 IP 是否已被放行（含白名单）。
+// IsDeviceAllowed 判断给定 MAC 或 IP 是否已被放行（若总开关关闭则放行全部设备）。
 func (s *Store) IsDeviceAllowed(mac, ip string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if !s.isGatekeeperEnabledLocked() {
+		return true
+	}
 	for _, pinned := range s.pinnedAdminIPs {
 		if pinned == ip {
 			return true
@@ -1454,13 +1532,10 @@ func computePauseRemainingSec(d model.Device, now time.Time) int64 {
 }
 
 func computeOnlineDuration(d model.Device, now time.Time) int64 {
-	if !d.Online {
+	if !d.Online || (d.Status != model.StatusApproved && !d.IsWhitelist) {
 		return 0
 	}
-	var start time.Time
-	if d.Status == model.StatusApproved || d.IsWhitelist {
-		start = d.ApprovedAt
-	}
+	start := d.ApprovedAt
 	if start.IsZero() {
 		start = d.FirstSeenAt
 	}

@@ -31,6 +31,13 @@ func NewMockManager(st *store.Store, adminPort, portalPort, dnsPort int) *MockMa
 }
 
 func (m *MockManager) SyncAll() error {
+	if !m.store.IsGatekeeperEnabled() {
+		m.mu.Lock()
+		m.lastScript = "# [MOCK] 准入认证总开关已关闭（全网自由直通模式）：已移除拦截规则，所有设备直接放行。\n"
+		m.ruleCount = 0
+		m.mu.Unlock()
+		return nil
+	}
 	wlMACs, wlIPs, allowedMACs, routerIP, lanIface, allowAdmin := m.store.GetFirewallSets()
 	script, count, err := BuildNFTablesScript(ScriptConfig{
 		RouterIP:        routerIP,
@@ -117,6 +124,9 @@ func (m *MockManager) KillConntrack(ips ...string) error {
 }
 
 func (m *MockManager) CurrentScript() string {
+	if !m.store.IsGatekeeperEnabled() {
+		return "# [MOCK] 准入认证总开关已关闭（全网自由直通模式）：已移除拦截规则，所有设备直接放行。\n"
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.lastScript != "" {

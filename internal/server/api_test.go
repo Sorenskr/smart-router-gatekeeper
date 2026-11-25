@@ -344,3 +344,176 @@ func TestTimedPauseAutoResumeAndPersistence(t *testing.T) {
 		t.Fatalf("重启后定时断网截止时间未正确持久化: %+v", devAfter)
 	}
 }
+
+func TestSecurityAndOfflineSyncOptimizations(t *testing.T) {
+	dataDir := t.TempDir()
+	srv, st, token := setupTestServer(t, dataDir)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.StartScheduler(ctx)
+	time.Sleep(30 * time.Millisecond)
+
+	admin := srv.AdminHandler()
+
+	// 1. 验证统一安全响应头
+	meReq := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
+	meRec := httptest.NewRecorder()
+	admin.ServeHTTP(meRec, meReq)
+	if meRec.Header().Get("X-Content-Type-Options") != "nosniff" || meRec.Header().Get("X-Frame-Options") != "SAMEORIGIN" {
+		t.Fatalf("缺少关键安全响应头: %+v", meRec.Header())
+	}
+
+	// 2. 验证登录暴力破解限流（连续 8 次失败后第 9 次返回 429）
+	for i := 0; i < 8; i++ {
+		badReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"password":"wrong"}`))
+		badReq.RemoteAddr = "192.168.6.55:12345"
+		badRec := httptest.NewRecorder()
+		admin.ServeHTTP(badRec, badReq)
+		if i < 7 && badRec.Code != http.StatusUnauthorized {
+			t.Fatalf("第 %d 次错误登录应返回 401，实际 %d", i+1, badRec.Code)
+		}
+		if i == 7 && badRec.Code != http.StatusTooManyRequests {
+			t.Fatalf("第 8 次失败应触发 429 锁定，实际 %d", badRec.Code)
+		}
+	}
+	lockedReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"password":"admin123"}`))
+	lockedReq.RemoteAddr = "192.168.6.55:12345"
+	lockedRec := httptest.NewRecorder()
+	admin.ServeHTTP(lockedRec, lockedReq)
+	if lockedRec.Code != http.StatusTooManyRequests {
+		t.Fatalf("被锁定 IP 在锁定期内即使用正确密码也应返回 429，实际 %d", lockedRec.Code)
+	}
+
+	// 不同 IP 可正常登录获取第 2 个会话 Token
+	otherLoginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"password":"admin123"}`))
+	otherLoginReq.RemoteAddr = "192.168.6.66:12345"
+	otherLoginRec := httptest.NewRecorder()
+	admin.ServeHTTP(otherLoginRec, otherLoginReq)
+	if otherLoginRec.Code != http.StatusOK {
+		t.Fatalf("其他正常 IP 登录应成功，实际 %d", otherLoginRec.Code)
+	}
+	var otherLogin struct {
+		Token string `json:"token"`
+	}
+	_ = json.Unmarshal(otherLoginRec.Body.Bytes(), &otherLogin)
+
+	// 3. 验证修改密码后，旧会话 Token 立即失效（返回 401），当前操作者会话保持有效
+	chgReq := httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(`{"new_password":"newpass456"}`))
+	chgReq.Header.Set("Authorization", "Bearer "+otherLogin.Token)
+	chgReq.Header.Set("Content-Type", "application/json")
+	chgRec := httptest.NewRecorder()
+	admin.ServeHTTP(chgRec, chgReq)
+	if chgRec.Code != http.StatusOK {
+		t.Fatalf("修改密码失败: %d %s", chgRec.Code, chgRec.Body.String())
+	}
+
+	oldSessReq := httptest.NewRequest(http.MethodGet, "/api/state", nil)
+	oldSessReq.Header.Set("Authorization", "Bearer "+token)
+	oldSessRec := httptest.NewRecorder()
+	admin.ServeHTTP(oldSessRec, oldSessReq)
+	if oldSessRec.Code != http.StatusUnauthorized {
+		t.Fatalf("改密后其他旧会话应立即失效返回 401，实际 %d", oldSessRec.Code)
+	}
+
+	currSessReq := httptest.NewRequest(http.MethodGet, "/api/state", nil)
+	currSessReq.Header.Set("Authorization", "Bearer "+otherLogin.Token)
+	currSessRec := httptest.NewRecorder()
+	admin.ServeHTTP(currSessRec, currSessReq)
+	if currSessRec.Code != http.StatusOK {
+		t.Fatalf("当前操作者改密后会话应保持有效，实际 %d", currSessRec.Code)
+	}
+
+	// 4. 验证真实路由模式下设备失踪后 markMissingOffline 离线超时置灰与速率归零
+	offMAC := "AA:BB:CC:DE:AD:01"
+	st.SyncObservations([]model.LiveDeviceObservation{
+		{MAC: offMAC, IP: "192.168.6.201", Hostname: "TempPhone", Online: true, RxRateBps: 5000, TxRateBps: 1000, ActiveConns: 5},
+	}, true)
+	_, _, _ = st.ApproveOrResume(offMAC, true, "")
+	// 验证仍在 30 秒缓冲期内不误离线
+	st.SyncObservations(nil, true)
+	if dev, ok := st.GetDevice(offMAC); !ok || !dev.Online {
+		t.Fatalf("30 秒缓冲期内不应被误标为离线: %+v", dev)
+	}
+	// 确认离线态与速率清零逻辑（直接测试 SyncObservations 同步 online=false 时清零）
+	st.SyncObservations([]model.LiveDeviceObservation{
+		{MAC: offMAC, IP: "192.168.6.201", Online: false, RxRateBps: 0, TxRateBps: 0, ActiveConns: 0},
+	}, true)
+	if dev, ok := st.GetDevice(offMAC); !ok || dev.Online || dev.RxRateBps != 0 || dev.OnlineDurationSec != 0 {
+		t.Fatalf("离线后在线状态与速率/时长应归零: %+v", dev)
+	}
+}
+
+func TestMasterSwitchBypassAndRestore(t *testing.T) {
+	dataDir := t.TempDir()
+	srv, st, token := setupTestServer(t, dataDir)
+	if !st.IsGatekeeperEnabled() {
+		t.Fatalf("默认状态总开关应为开启")
+	}
+
+	admin := srv.AdminHandler()
+	portal := srv.PortalHandler()
+
+	unregMAC := "AA:BB:CC:66:55:44"
+	// 开启时，未登记设备探针 /generate_204 返回 302 拦截
+	pReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8089/generate_204?mac="+unregMAC, nil)
+	pRec := httptest.NewRecorder()
+	portal.ServeHTTP(pRec, pReq)
+	if pRec.Code != http.StatusFound {
+		t.Fatalf("总开关开启时未授权设备应被 302 拦截，实际 %d", pRec.Code)
+	}
+
+	// 关闭总开关 -> 探针应立即返回 204 直接放行，门户状态返回 gatekeeper_enabled=false，防火墙脚本变为直通注释
+	offReq := httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(`{"gatekeeper_enabled":false}`))
+	offReq.Header.Set("Authorization", "Bearer "+token)
+	offReq.Header.Set("Content-Type", "application/json")
+	offRec := httptest.NewRecorder()
+	admin.ServeHTTP(offRec, offReq)
+	if offRec.Code != http.StatusOK {
+		t.Fatalf("关闭总开关失败: %d %s", offRec.Code, offRec.Body.String())
+	}
+
+	pReqBypass := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8089/generate_204?mac="+unregMAC, nil)
+	pRecBypass := httptest.NewRecorder()
+	portal.ServeHTTP(pRecBypass, pReqBypass)
+	if pRecBypass.Code != http.StatusNoContent {
+		t.Fatalf("关闭总开关后未登记设备应返回 204 直接放行，实际 %d", pRecBypass.Code)
+	}
+
+	stReq := httptest.NewRequest(http.MethodGet, "/api/portal/status?mac="+unregMAC, nil)
+	stRec := httptest.NewRecorder()
+	portal.ServeHTTP(stRec, stReq)
+	var ps model.PortalStatus
+	_ = json.Unmarshal(stRec.Body.Bytes(), &ps)
+	if ps.GatekeeperEnabled {
+		t.Fatalf("门户状态应同步反映 gatekeeper_enabled=false")
+	}
+
+	fwReq := httptest.NewRequest(http.MethodGet, "/api/firewall/script", nil)
+	fwReq.Header.Set("Authorization", "Bearer "+token)
+	fwRec := httptest.NewRecorder()
+	admin.ServeHTTP(fwRec, fwReq)
+	if !strings.Contains(fwRec.Body.String(), "自由直通") {
+		t.Fatalf("总开关关闭时防火墙脚本应提示自由直通模式: %s", fwRec.Body.String())
+	}
+
+	// 模拟服务重启，验证总开关关闭状态持久化保留，随后再重新开启验证恢复拦截
+	srv2, st2, token2 := setupTestServer(t, dataDir)
+	if st2.IsGatekeeperEnabled() {
+		t.Fatalf("重启后总开关关闭状态未持久化")
+	}
+	onReq := httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(`{"gatekeeper_enabled":true}`))
+	onReq.Header.Set("Authorization", "Bearer "+token2)
+	onReq.Header.Set("Content-Type", "application/json")
+	onRec := httptest.NewRecorder()
+	srv2.AdminHandler().ServeHTTP(onRec, onReq)
+	if onRec.Code != http.StatusOK {
+		t.Fatalf("重开总开关失败: %d", onRec.Code)
+	}
+
+	pReqRestored := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8089/generate_204?mac="+unregMAC, nil)
+	pRecRestored := httptest.NewRecorder()
+	srv2.PortalHandler().ServeHTTP(pRecRestored, pReqRestored)
+	if pRecRestored.Code != http.StatusFound {
+		t.Fatalf("重开总开关后应立即恢复 302 拦截，实际 %d", pRecRestored.Code)
+	}
+}

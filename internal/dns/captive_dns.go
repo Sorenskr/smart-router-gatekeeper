@@ -16,6 +16,7 @@ type Server struct {
 	targetIP net.IP
 	udpConn  *net.UDPConn
 	tcpLn    net.Listener
+	tcpSem   chan struct{}
 	wg       sync.WaitGroup
 }
 
@@ -28,6 +29,7 @@ func NewServer(listenAddr, routerIP string) (*Server, error) {
 	return &Server{
 		addr:     listenAddr,
 		targetIP: ip,
+		tcpSem:   make(chan struct{}, 64),
 	}, nil
 }
 
@@ -99,8 +101,15 @@ func (s *Server) serveTCP(ctx context.Context) {
 				return
 			}
 		}
+		select {
+		case s.tcpSem <- struct{}{}:
+		default:
+			_ = conn.Close()
+			continue
+		}
 		s.wg.Add(1)
 		go func(c net.Conn) {
+			defer func() { <-s.tcpSem }()
 			defer s.wg.Done()
 			defer c.Close()
 			_ = c.SetDeadline(time.Now().Add(5 * time.Second))
@@ -182,12 +191,12 @@ func BuildDNSResponse(req []byte, targetIP net.IP) ([]byte, error) {
 
 	if qdCount >= 1 && qType == 1 && (qClass == 1 || qClass == 255) {
 		binary.BigEndian.PutUint16(resp[6:8], 1) // ANCOUNT = 1
-		// Answer RR: Name pointer 0xC00C, Type=A(1), Class=IN(1), TTL=5s, RDLength=4, IPv4
+		// Answer RR: Name pointer 0xC00C, Type=A(1), Class=IN(1), TTL=2s, RDLength=4, IPv4
 		resp = append(resp,
 			0xC0, 0x0C,
 			0x00, 0x01,
 			0x00, 0x01,
-			0x00, 0x00, 0x00, 0x05,
+			0x00, 0x00, 0x00, 0x02,
 			0x00, 0x04,
 			ip4[0], ip4[1], ip4[2], ip4[3],
 		)

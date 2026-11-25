@@ -84,6 +84,7 @@ func (d Device) ComputeDisplayName() string {
 // Settings 是持久化到磁盘的系统配置。
 type Settings struct {
 	MaxConcurrentDevices int    `json:"max_concurrent_devices"`
+	GatekeeperEnabled    *bool  `json:"gatekeeper_enabled,omitempty"`
 	AdminPasswordHash    string `json:"admin_password_hash"`
 	AdminPasswordSalt    string `json:"admin_password_salt"`
 	RouterIP             string `json:"router_ip"`
@@ -97,6 +98,7 @@ type Settings struct {
 // SettingsView 是脱敏后推送给前端的只读配置视图。
 type SettingsView struct {
 	MaxConcurrentDevices int    `json:"max_concurrent_devices"`
+	GatekeeperEnabled    bool   `json:"gatekeeper_enabled"`
 	RouterIP             string `json:"router_ip"`
 	LanIface             string `json:"lan_iface"`
 	PortalTitle          string `json:"portal_title"`
@@ -119,10 +121,12 @@ type AuditEvent struct {
 // TunnelStatus 描述 Cloudflare Tunnel 全球远程访问状态。
 type TunnelStatus struct {
 	Running    bool       `json:"running"`
+	Connected  bool       `json:"connected"`
 	Mode       string     `json:"mode"`
 	PublicURL  string     `json:"public_url"`
 	StatusText string     `json:"status_text"`
 	Error      string     `json:"error,omitempty"`
+	RecentLogs []string   `json:"recent_logs,omitempty"`
 	StartedAt  *time.Time `json:"started_at,omitempty"`
 }
 
@@ -193,11 +197,12 @@ func (e *ConcurrencyConflictError) Error() string {
 
 // PortalStatus 为手机认证页单设备实时状态视图。
 type PortalStatus struct {
-	MAC               string    `json:"mac"`
-	IP                string    `json:"ip"`
-	Hostname          string    `json:"hostname"`
-	Status            string    `json:"status"`
-	RequestedName     string    `json:"requested_name"`
+	MAC               string     `json:"mac"`
+	IP                string     `json:"ip"`
+	Hostname          string     `json:"hostname"`
+	Status            string     `json:"status"`
+	GatekeeperEnabled bool       `json:"gatekeeper_enabled"`
+	RequestedName     string     `json:"requested_name"`
 	AdminRemark       string    `json:"admin_remark"`
 	DisplayName       string    `json:"display_name"`
 	IsWhitelist       bool      `json:"is_whitelist"`

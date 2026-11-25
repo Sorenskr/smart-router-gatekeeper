@@ -8,6 +8,7 @@
     authenticated: false,
     mockMode: false,
     snapshot: null,
+    serverClockOffsetMs: 0,
     ws: null,
     wsTimer: null,
     filter: localStorage.getItem('gk_filter') || 'all',
@@ -21,7 +22,7 @@
     knownPendingMacs: new Set(),
     hasReceivedInitialState: false,
     audioCtx: null,
-    rowCache: new Map(), // MAC -> { el, refs, prev } Keyed DOM 增量复用池
+    rowCache: new Map(),
     tunnelOpen: false,
   };
 
@@ -50,6 +51,11 @@
     whitelistBanner: document.getElementById('whitelist-banner'),
     whitelistBannerText: document.getElementById('whitelist-banner-text'),
     btnProtectViewer: document.getElementById('btn-protect-viewer'),
+    masterSwitchCard: document.getElementById('master-switch-card'),
+    masterBadge: document.getElementById('master-badge'),
+    masterDesc: document.getElementById('master-desc'),
+    btnMasterSwitch: document.getElementById('btn-master-switch'),
+    masterSwitchText: document.getElementById('master-switch-text'),
     kpiAuthCount: document.getElementById('kpi-auth-count'),
     kpiMaxCount: document.getElementById('kpi-max-count'),
     kpiQuotaBar: document.getElementById('kpi-quota-bar'),
@@ -73,7 +79,9 @@
     tunnelUrlBox: document.getElementById('tunnel-url-box'),
     tunnelPublicUrl: document.getElementById('tunnel-public-url'),
     btnCopyTunnel: document.getElementById('btn-copy-tunnel'),
+    tunnelLogs: document.getElementById('tunnel-logs'),
     tunnelModeSelect: document.getElementById('tunnel-mode-select'),
+    btnTunnelInstall: document.getElementById('btn-tunnel-install'),
     btnTunnelStart: document.getElementById('btn-tunnel-start'),
     btnTunnelStop: document.getElementById('btn-tunnel-stop'),
     pendingStrip: document.getElementById('pending-strip'),
@@ -125,6 +133,22 @@
     toastContainer: document.getElementById('toast-container'),
   };
 
+  // 全局点击水波纹动效（GPU transform + opacity 合成，极速不掉帧）
+  document.addEventListener('pointerdown', (e) => {
+    const target = e.target.closest('.btn, .tab-btn, .tag-chip, .duration-chip, .stepper-btn, .switch-btn, .conflict-device-btn');
+    if (!target || target.disabled) return;
+    const rect = target.getBoundingClientRect();
+    const size = Math.max(rect.width, rect.height);
+    const wave = document.createElement('span');
+    wave.className = 'ripple';
+    wave.style.width = `${size}px`;
+    wave.style.height = `${size}px`;
+    wave.style.left = `${e.clientX - rect.left - size / 2}px`;
+    wave.style.top = `${e.clientY - rect.top - size / 2}px`;
+    target.appendChild(wave);
+    setTimeout(() => wave.remove(), 420);
+  });
+
   function setText(el, val) {
     if (el && el.textContent !== val) el.textContent = val;
   }
@@ -145,6 +169,15 @@
     div.textContent = msg;
     els.toastContainer.appendChild(div);
     setTimeout(() => div.remove(), 2800);
+  }
+
+  function flashRow(mac, kind) {
+    const entry = state.rowCache.get(mac);
+    if (!entry) return;
+    const cls = kind === 'danger' ? 'flash-danger' : kind === 'info' ? 'flash-info' : 'flash-success';
+    entry.el.classList.remove('flash-success', 'flash-danger', 'flash-info');
+    void entry.el.offsetWidth;
+    entry.el.classList.add(cls);
   }
 
   function formatRate(bps) {
@@ -178,12 +211,16 @@
     return d.toLocaleTimeString('zh-CN', { hour12: false });
   }
 
+  function alignedNowMs() {
+    return Date.now() + state.serverClockOffsetMs;
+  }
+
   function formatConnectTime(d) {
     const raw = (d.status === 'approved' || d.is_whitelist) ? (d.approved_at || d.first_seen_at) : (d.requested_at || d.first_seen_at);
     if (!raw) return { label: '时间未知', full: '' };
     const dt = new Date(raw);
     if (Number.isNaN(dt.getTime()) || dt.getFullYear() < 2000) return { label: '时间未知', full: '' };
-    const now = new Date();
+    const now = new Date(alignedNowMs());
     const hm = `${String(dt.getHours()).padStart(2, '0')}:${String(dt.getMinutes()).padStart(2, '0')}`;
     const full = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')} ${hm}:${String(dt.getSeconds()).padStart(2, '0')}`;
     const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
@@ -200,28 +237,41 @@
     if (raw) {
       const ts = new Date(raw).getTime();
       if (!Number.isNaN(ts) && ts > 946684800000) {
-        return Math.max(0, Math.floor((Date.now() - ts) / 1000));
+        return Math.max(0, Math.floor((alignedNowMs() - ts) / 1000));
       }
     }
     return d.online_duration_sec || 0;
   }
 
+  // 分钟 / 小时 / 天三种单位均精确到秒，每秒持续走表不卡顿
   function formatDurationByUnit(sec, unit) {
     if (sec <= 0) {
-      return unit === 'd' ? '0.00 天' : unit === 'h' ? '0.0 小时' : '0 分钟';
+      return unit === 'd' ? '0 天 00 时 00 分 00 秒' : unit === 'h' ? '0 时 00 分 00 秒' : '0 秒';
     }
-    if (unit === 'h') return `${(sec / 3600).toFixed(1)} 小时`;
-    if (unit === 'd') return `${(sec / 86400).toFixed(2)} 天`;
+    if (unit === 'h') {
+      const h = Math.floor(sec / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      const s = sec % 60;
+      return `${h} 时 ${String(m).padStart(2, '0')} 分 ${String(s).padStart(2, '0')} 秒`;
+    }
+    if (unit === 'd') {
+      const days = Math.floor(sec / 86400);
+      const h = Math.floor((sec % 86400) / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      const s = sec % 60;
+      return `${days} 天 ${String(h).padStart(2, '0')} 时 ${String(m).padStart(2, '0')} 分 ${String(s).padStart(2, '0')} 秒`;
+    }
     const mins = Math.floor(sec / 60);
-    if (mins < 1) return `1分钟内 (${sec}秒)`;
-    return `${mins} 分钟`;
+    const s = sec % 60;
+    if (mins === 0) return `${s} 秒`;
+    return `${mins} 分 ${String(s).padStart(2, '0')} 秒`;
   }
 
   function getLivePauseRemainingSec(d) {
     if (d.status !== 'paused' || !d.pause_until) return 0;
     const ts = new Date(d.pause_until).getTime();
     if (Number.isNaN(ts)) return 0;
-    return Math.max(0, Math.ceil((ts - Date.now()) / 1000));
+    return Math.max(0, Math.ceil((ts - alignedNowMs()) / 1000));
   }
 
   function formatCountdown(sec) {
@@ -377,6 +427,12 @@
   }
 
   function applySnapshot(snap) {
+    if (snap.generated_at) {
+      const serverTs = new Date(snap.generated_at).getTime();
+      if (!Number.isNaN(serverTs) && serverTs > 946684800000) {
+        state.serverClockOffsetMs = serverTs - Date.now();
+      }
+    }
     state.snapshot = snap;
     state.mockMode = Boolean(snap.health?.mock_mode);
 
@@ -404,6 +460,7 @@
     if (!snap) return;
     renderTopbar(snap);
     renderWhitelistBanner(snap);
+    renderMasterSwitch(snap);
     renderKPIs(snap);
     renderPendingStrip(snap);
     renderTunnel(snap);
@@ -433,7 +490,27 @@
     }
     setText(els.routerMeta, `网关 ${h.router_ip || '192.168.6.1'} (${h.lan_iface || 'br-lan'})`);
     setText(els.soundLabel, snap.settings?.sound_enabled ? '提示音开' : '提示音关');
-    els.tunnelNavDot.className = snap.tunnel?.running ? 'dot dot-green' : 'dot dot-gray';
+    els.tunnelNavDot.className = snap.tunnel?.connected
+      ? 'dot dot-green'
+      : snap.tunnel?.running ? 'dot dot-amber' : 'dot dot-gray';
+  }
+
+  function renderMasterSwitch(snap) {
+    const enabled = snap.settings?.gatekeeper_enabled !== false;
+    els.btnMasterSwitch.setAttribute('aria-checked', String(enabled));
+    els.btnMasterSwitch.classList.toggle('on', enabled);
+    els.masterSwitchCard.classList.toggle('is-enabled', enabled);
+    els.masterSwitchCard.classList.toggle('is-bypass', !enabled);
+    setText(els.masterSwitchText, enabled ? '已开启' : '已关闭直通');
+    if (enabled) {
+      els.masterBadge.className = 'pill pill-success';
+      setText(els.masterBadge, '管控运行中');
+      setText(els.masterDesc, '开启时：新手机需填昵称并审批才能上网，支持断网与并发数量限制；关闭后：所有设备免填昵称直接自由上网。');
+    } else {
+      els.masterBadge.className = 'pill pill-amber';
+      setText(els.masterBadge, '自由直通模式');
+      setText(els.masterDesc, '总开关已关闭：已自动卸除拦截规则，任何手机无需输入昵称均可直接联网且不受设备数限制。');
+    }
   }
 
   function renderWhitelistBanner(snap) {
@@ -448,6 +525,7 @@
   function renderKPIs(snap) {
     const devices = snap.devices || [];
     const max = snap.settings?.max_concurrent_devices || 2;
+    const gkEnabled = snap.settings?.gatekeeper_enabled !== false;
     let authCount = 0;
     let authOnline = 0;
     let wlCount = 0;
@@ -477,7 +555,6 @@
       }
     }
 
-    // 同步筛选 tab 上的实时数量
     setText(els.cntAll, String(devices.length));
     setText(els.cntApproved, String(authCount));
     setText(els.cntPending, String(pendingCount));
@@ -504,21 +581,20 @@
 
     setText(els.kpiBlockedCount, String(blockedCount));
     setText(els.kpiTotalTraffic, `↓ ${formatRate(rxSum)} · ↑ ${formatRate(txSum)}`);
-    setText(els.kpiBlockedSub, `当前暂停断网 ${pausedCount} 台 · 已封堵 PassWall 绕过`);
+    setText(els.kpiBlockedSub, gkEnabled ? `当前暂停断网 ${pausedCount} 台 · 已封堵 PassWall 绕过` : '总开关已关闭（自由直通中）');
 
     const h = snap.health || {};
-    els.probeDomestic.innerHTML = h.domestic_reachable
-      ? `<span style="color:#34d399">通</span> (${h.domestic_latency_ms}ms)`
-      : `<span style="color:#fb7185">断</span>`;
-    els.probeProxy.innerHTML = h.proxy_reachable
-      ? `<span style="color:#38bdf8">通</span> (${h.proxy_latency_ms}ms)`
-      : `<span style="color:#fbbf24">待定</span>`;
-    setText(els.kpiNftBadge, h.nftables_active ? `已防护 (${h.firewall_rules_count || 0})` : '未就绪');
+    els.probeDomestic.style.color = h.domestic_reachable ? '#34d399' : '#fb7185';
+    setText(els.probeDomestic, h.domestic_reachable ? `通 (${h.domestic_latency_ms}ms)` : '断');
+    els.probeProxy.style.color = h.proxy_reachable ? '#38bdf8' : '#fbbf24';
+    setText(els.probeProxy, h.proxy_reachable ? `通 (${h.proxy_latency_ms}ms)` : '待定');
+    setText(els.kpiNftBadge, !gkEnabled ? '已直通' : h.nftables_active ? `已防护 (${h.firewall_rules_count || 0})` : '未就绪');
     setText(els.kpiHealthSub, `${h.passwall_active ? 'PassWall 运行中' : 'PassWall 未运行'} · 负载 ${h.cpu_load || '-'}`);
   }
 
   function renderPendingStrip(snap) {
-    const pendingList = (snap.devices || []).filter((d) => d.status === 'pending');
+    const gkEnabled = snap.settings?.gatekeeper_enabled !== false;
+    const pendingList = gkEnabled ? (snap.devices || []).filter((d) => d.status === 'pending') : [];
     if (pendingList.length === 0) {
       els.pendingStrip.classList.add('hidden');
       if (els.pendingCards.childElementCount > 0) els.pendingCards.innerHTML = '';
@@ -541,9 +617,18 @@
 
   function renderTunnel(snap) {
     const t = snap.tunnel || {};
+    const h = snap.health || {};
+    const needInstall = !h.mock_mode && !h.cloudflared_installed;
+    els.btnTunnelInstall.classList.toggle('hidden', !needInstall);
+
     if (t.running) {
-      els.tunnelBadge.className = 'pill pill-success';
-      setText(els.tunnelBadge, t.mode === 'mock' || snap.health?.mock_mode ? '已连接（仿真）' : '公网在线');
+      if (t.connected) {
+        els.tunnelBadge.className = 'pill pill-success';
+        setText(els.tunnelBadge, t.mode === 'mock' || h.mock_mode ? '已连通（仿真）' : 'HTTP/2 已连通');
+      } else {
+        els.tunnelBadge.className = 'pill pill-amber';
+        setText(els.tunnelBadge, '正在连接边缘节点...');
+      }
       setText(els.tunnelDesc, t.status_text || '全球访问隧道运行中');
       els.btnTunnelStart.classList.add('hidden');
       els.btnTunnelStop.classList.remove('hidden');
@@ -555,12 +640,20 @@
         els.tunnelUrlBox.classList.add('hidden');
       }
     } else {
-      els.tunnelBadge.className = 'pill pill-muted';
-      setText(els.tunnelBadge, '未启用');
-      setText(els.tunnelDesc, t.error ? `提示：${t.error}` : '无需公网 IP 与域名，一键生成加密 HTTPS 地址，在全球任何电脑打开即可实时断网/放行设备。');
+      els.tunnelBadge.className = needInstall ? 'pill pill-amber' : 'pill pill-muted';
+      setText(els.tunnelBadge, needInstall ? '缺少 cloudflared' : '未启用');
+      setText(els.tunnelDesc, t.error ? `提示：${t.error}` : '已启用 HTTP/2 协议穿透国内网络，无需公网 IP 与域名，一键生成加密 HTTPS 地址。');
       els.btnTunnelStart.classList.remove('hidden');
       els.btnTunnelStop.classList.add('hidden');
       els.tunnelUrlBox.classList.add('hidden');
+    }
+
+    const logs = t.recent_logs || [];
+    if (logs.length > 0) {
+      els.tunnelLogs.classList.remove('hidden');
+      setText(els.tunnelLogs, logs.join('\n'));
+    } else {
+      els.tunnelLogs.classList.add('hidden');
     }
   }
 
@@ -807,7 +900,6 @@
 
     if (d.online && (d.status === 'approved' || d.is_whitelist)) {
       refs.durationChip.classList.remove('hidden');
-      refs.durationChip.classList.remove('is-paused');
       const liveSec = getLiveOnlineSeconds(d);
       setText(refs.durationChip, `⏱ ${formatDurationByUnit(liveSec, state.durationUnit)} ↻`);
     } else {
@@ -860,7 +952,6 @@
     }
   }
 
-  // Keyed 增量协调：复用已有行节点，绝不摧毁整张表 DOM！
   function reconcileDeviceList(snap) {
     const list = computeSortedFilteredDevices(snap);
 
@@ -885,6 +976,12 @@
     Array.from(els.devicesList.children).forEach((child) => {
       if (!activeMacs.has(child.dataset.mac)) child.remove();
     });
+    const allKnownMacs = new Set((snap.devices || []).map((d) => d.mac));
+    for (const cachedMac of state.rowCache.keys()) {
+      if (!allKnownMacs.has(cachedMac)) {
+        state.rowCache.delete(cachedMac);
+      }
+    }
 
     list.forEach((d, idx) => {
       let entry = state.rowCache.get(d.mac);
@@ -900,7 +997,7 @@
     });
   }
 
-  // 全局 1 秒轻量走表：仅刷新已连时长与定时断网剩余秒数 textContent
+  // 每秒精确更新全部在线时长与定时断网剩余倒计时
   setInterval(() => {
     if (!state.authenticated || !state.snapshot) return;
     for (const d of state.snapshot.devices || []) {
@@ -922,13 +1019,39 @@
     }
   }, 1000);
 
-  // 乐观更新辅助：立即本地切换状态 + 补丁 DOM，0ms 体感
   function findLocalDevice(mac) {
     return (state.snapshot?.devices || []).find((d) => d.mac === mac);
   }
 
   function cloneSnapshot() {
     return JSON.parse(JSON.stringify(state.snapshot));
+  }
+
+  async function toggleMasterSwitch() {
+    if (!state.snapshot?.settings) return;
+    const curr = state.snapshot.settings.gatekeeper_enabled !== false;
+    const next = !curr;
+    const backup = cloneSnapshot();
+    state.snapshot.settings.gatekeeper_enabled = next;
+    renderAllFromSnapshot();
+
+    try {
+      const { ok, data } = await apiFetch('/api/settings', {
+        method: 'PUT',
+        body: JSON.stringify({ gatekeeper_enabled: next }),
+      });
+      if (!ok) {
+        state.snapshot = backup;
+        renderAllFromSnapshot();
+        showToast(data?.error || '切换总开关失败', 'error');
+        return;
+      }
+      showToast(next ? '准入认证总开关已开启，已恢复拦截管控' : '总开关已关闭，已切换为自由直通模式', 'success');
+    } catch (err) {
+      state.snapshot = backup;
+      renderAllFromSnapshot();
+      showToast(err.message || '切换失败', 'error');
+    }
   }
 
   async function approveOrResumeDevice(mac, mode = 'approve', options = {}) {
@@ -941,11 +1064,12 @@
       if (dev.is_whitelist || currentAuth < maxConc) {
         backup = cloneSnapshot();
         dev.status = 'approved';
-        dev.approved_at = new Date().toISOString();
+        dev.approved_at = new Date(alignedNowMs()).toISOString();
         dev.pause_until = null;
         dev.pause_remaining_sec = 0;
         dev.auto_resume_error = '';
         renderAllFromSnapshot();
+        flashRow(mac, 'success');
       }
     }
 
@@ -963,6 +1087,7 @@
         return;
       }
       closeConflictModal();
+      flashRow(mac, 'success');
       showToast(data?.evicted ? `已顶替「${data.evicted.display_name}」并放行` : '已放行联网', 'success');
     } catch (err) {
       if (backup) { state.snapshot = backup; renderAllFromSnapshot(); }
@@ -981,13 +1106,14 @@
       dev.active_conns = 0;
       dev.auto_resume_error = '';
       if (durationMinutes > 0) {
-        dev.pause_until = new Date(Date.now() + durationMinutes * 60000).toISOString();
+        dev.pause_until = new Date(alignedNowMs() + durationMinutes * 60000).toISOString();
         dev.pause_remaining_sec = Math.round(durationMinutes * 60);
       } else {
         dev.pause_until = null;
         dev.pause_remaining_sec = 0;
       }
       renderAllFromSnapshot();
+      flashRow(mac, 'danger');
     }
 
     try {
@@ -1119,6 +1245,8 @@
     showLoginView();
   });
 
+  els.btnMasterSwitch.addEventListener('click', toggleMasterSwitch);
+
   els.btnToggleTunnel.addEventListener('click', () => {
     state.tunnelOpen = !state.tunnelOpen;
     els.tunnelDrawer.classList.toggle('hidden', !state.tunnelOpen);
@@ -1188,6 +1316,23 @@
     else showToast(data?.error || '保护失败', 'error');
   });
 
+  els.btnTunnelInstall.addEventListener('click', async () => {
+    els.btnTunnelInstall.disabled = true;
+    setText(els.btnTunnelInstall, '正在下载安装...');
+    try {
+      const { ok, data } = await apiFetch('/api/tunnel/install', { method: 'POST' });
+      if (!ok) {
+        showToast(data?.error || '自动安装失败', 'error');
+      } else {
+        showToast(data?.message || 'cloudflared 安装完成', 'success');
+        await fetchInitialState();
+      }
+    } finally {
+      els.btnTunnelInstall.disabled = false;
+      setText(els.btnTunnelInstall, '一键安装 cloudflared');
+    }
+  });
+
   els.btnTunnelStart.addEventListener('click', async () => {
     els.btnTunnelStart.disabled = true;
     try {
@@ -1196,7 +1341,7 @@
         body: JSON.stringify({ mode: els.tunnelModeSelect.value }),
       });
       if (!ok) showToast(data?.error || '启动隧道失败', 'error');
-      else showToast('Cloudflare 远程隧道已启动', 'success');
+      else showToast('正在通过 HTTP/2 建立 Cloudflare 远程隧道...', 'success');
     } finally {
       els.btnTunnelStart.disabled = false;
     }
@@ -1249,7 +1394,6 @@
     if (state.snapshot) reconcileDeviceList(state.snapshot);
   });
 
-  // 定时断网弹出层内部点击
   els.timedPausePopover.addEventListener('click', (e) => {
     const qBtn = e.target.closest('[data-mins]');
     if (qBtn && state.popoverMac) {
@@ -1278,7 +1422,6 @@
     }
   });
 
-  // 设备列表 & 快捷审批区点击处理
   async function saveRemark(mac, newRemark) {
     const dev = findLocalDevice(mac);
     const backup = dev ? cloneSnapshot() : null;
@@ -1289,6 +1432,7 @@
     state.editingMac = null;
     state.editingDraft = '';
     if (state.snapshot) renderAllFromSnapshot();
+    flashRow(mac, 'info');
 
     try {
       const { ok, data } = await apiFetch(`/api/devices/${encodeURIComponent(mac)}/remark`, {
@@ -1329,6 +1473,12 @@
       state.durationUnit = DURATION_UNITS[(idx + 1) % DURATION_UNITS.length];
       localStorage.setItem('gk_duration_unit', state.durationUnit);
       if (state.snapshot) reconcileDeviceList(state.snapshot);
+      const entry = state.rowCache.get(mac);
+      if (entry) {
+        entry.refs.durationChip.classList.remove('chip-bounce');
+        void entry.refs.durationChip.offsetWidth;
+        entry.refs.durationChip.classList.add('chip-bounce');
+      }
     } else if (action === 'toggle-whitelist') {
       const next = btn.getAttribute('data-next') === 'true';
       const dev = findLocalDevice(mac);
@@ -1337,6 +1487,7 @@
         dev.is_whitelist = next;
         if (next) { dev.status = 'approved'; dev.pause_until = null; dev.pause_remaining_sec = 0; }
         renderAllFromSnapshot();
+        flashRow(mac, 'info');
       }
       const { ok, data } = await apiFetch(`/api/devices/${encodeURIComponent(mac)}/whitelist`, {
         method: 'PUT',
@@ -1351,6 +1502,7 @@
     } else if (action === 'delete') {
       const backup = cloneSnapshot();
       state.snapshot.devices = (state.snapshot.devices || []).filter((d) => d.mac !== mac);
+      state.rowCache.delete(mac);
       renderAllFromSnapshot();
       const { ok, data } = await apiFetch(`/api/devices/${encodeURIComponent(mac)}`, { method: 'DELETE' });
       if (!ok) {
@@ -1432,6 +1584,24 @@
     }
     closeSettings();
     showToast('设置已保存并生效', 'success');
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    closeTimedPausePopover();
+    closeConflictModal();
+    els.guideModal.classList.add('hidden');
+    els.auditModal.classList.add('hidden');
+    closeSettings();
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && state.authenticated) {
+      fetchInitialState().catch(() => {});
+      if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+        connectWebSocket();
+      }
+    }
   });
 
   bootstrap();

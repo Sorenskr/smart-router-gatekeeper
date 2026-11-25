@@ -128,7 +128,7 @@ func (m *MockMonitor) tick() {
 	m.health.FirewallRulesCount = ruleCount
 	m.mu.Unlock()
 
-	m.store.SyncObservations(observations)
+	m.store.SyncObservations(observations, false)
 }
 
 func (m *MockMonitor) Health() model.SystemHealth {

@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gatekeeper/internal/firewall"
@@ -29,33 +30,109 @@ const (
 	sessionCookieName = "gk_session"
 	mockMACCookieName = "gk_mock_mac"
 	defaultMockMAC    = "AA:BB:CC:11:22:03"
+	loginMaxFailures  = 8
+	loginWindow       = 5 * time.Minute
+	loginLockDuration = 5 * time.Minute
 )
+
+type loginAttempt struct {
+	count       int
+	windowStart time.Time
+	lockedUntil time.Time
+}
+
+type loginLimiter struct {
+	mu       sync.Mutex
+	attempts map[string]*loginAttempt
+}
+
+func newLoginLimiter() *loginLimiter {
+	return &loginLimiter{
+		attempts: make(map[string]*loginAttempt),
+	}
+}
+
+func (l *loginLimiter) allow(ip string) (bool, int) {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	att, ok := l.attempts[ip]
+	if !ok {
+		return true, 0
+	}
+	if now.Before(att.lockedUntil) {
+		rem := int(math.Ceil(att.lockedUntil.Sub(now).Seconds()))
+		if rem < 1 {
+			rem = 1
+		}
+		return false, rem
+	}
+	if now.Sub(att.windowStart) > loginWindow {
+		delete(l.attempts, ip)
+	}
+	return true, 0
+}
+
+func (l *loginLimiter) recordFailure(ip string) (locked bool, retryAfterSec int) {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if len(l.attempts) > 256 {
+		for k, v := range l.attempts {
+			if now.After(v.lockedUntil) && now.Sub(v.windowStart) > 2*loginWindow {
+				delete(l.attempts, k)
+			}
+		}
+	}
+
+	att, ok := l.attempts[ip]
+	if !ok || now.Sub(att.windowStart) > loginWindow {
+		l.attempts[ip] = &loginAttempt{count: 1, windowStart: now}
+		return false, 0
+	}
+	att.count++
+	if att.count >= loginMaxFailures {
+		att.lockedUntil = now.Add(loginLockDuration)
+		return true, int(loginLockDuration.Seconds())
+	}
+	return false, 0
+}
+
+func (l *loginLimiter) reset(ip string) {
+	l.mu.Lock()
+	delete(l.attempts, ip)
+	l.mu.Unlock()
+}
 
 // Server 聚合管理大屏 HTTP/WS 路由与 Captive Portal 强制认证页路由。
 type Server struct {
-	store     *store.Store
-	fw        firewall.Manager
-	mon       monitor.Monitor
-	tunnel    *tunnel.Manager
-	hub       *ws.Hub
-	mockMode  bool
-	adminPort int
-	portalPort int
-	broadcastMu sync.Mutex
-	lastPush    time.Time
+	store             *store.Store
+	fw                firewall.Manager
+	mon               monitor.Monitor
+	tunnel            *tunnel.Manager
+	hub               *ws.Hub
+	mockMode          bool
+	adminPort         int
+	portalPort        int
+	broadcastCh       chan struct{}
+	broadcasterActive atomic.Bool
+	limiter           *loginLimiter
 }
 
 // NewServer 创建服务端实例并订阅状态推送。
 func NewServer(st *store.Store, fw firewall.Manager, mon monitor.Monitor, tun *tunnel.Manager, hub *ws.Hub, mockMode bool, adminPort, portalPort int) *Server {
 	s := &Server{
-		store:      st,
-		fw:         fw,
-		mon:        mon,
-		tunnel:     tun,
-		hub:        hub,
-		mockMode:   mockMode,
-		adminPort:  adminPort,
-		portalPort: portalPort,
+		store:       st,
+		fw:          fw,
+		mon:         mon,
+		tunnel:      tun,
+		hub:         hub,
+		mockMode:    mockMode,
+		adminPort:   adminPort,
+		portalPort:  portalPort,
+		broadcastCh: make(chan struct{}, 1),
+		limiter:     newLoginLimiter(),
 	}
 	st.Subscribe(func() {
 		s.BroadcastAll()
@@ -63,8 +140,21 @@ func NewServer(st *store.Store, fw firewall.Manager, mon monitor.Monitor, tun *t
 	return s
 }
 
-// StartScheduler 每秒巡检定时断网到期设备并自动恢复防火墙放行与推送实时状态。
+// StartScheduler 启动定时断网到期巡检与非阻塞合并广播协程。
 func (s *Server) StartScheduler(ctx context.Context) {
+	s.broadcasterActive.Store(true)
+	go func() {
+		defer s.broadcasterActive.Store(false)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-s.broadcastCh:
+				s.flushBroadcast()
+			}
+		}
+	}()
+
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -83,12 +173,19 @@ func (s *Server) StartScheduler(ctx context.Context) {
 	}
 }
 
-// BroadcastAll 即时向所有管理端与认证页 WebSocket 推送最新状态。
+// BroadcastAll 触发一次异步合并推流（高并发写入不会阻塞 HTTP 响应）。
 func (s *Server) BroadcastAll() {
-	s.broadcastMu.Lock()
-	s.lastPush = time.Now()
-	s.broadcastMu.Unlock()
+	if !s.broadcasterActive.Load() {
+		s.flushBroadcast()
+		return
+	}
+	select {
+	case s.broadcastCh <- struct{}{}:
+	default:
+	}
+}
 
+func (s *Server) flushBroadcast() {
 	health := s.mon.Health()
 	tunStatus := s.tunnel.Status()
 	s.hub.BroadcastAdmin(func(viewerIP string) any {
@@ -99,9 +196,16 @@ func (s *Server) BroadcastAll() {
 	})
 }
 
+func applySecurityHeaders(w http.ResponseWriter) {
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "SAMEORIGIN")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+}
+
 // AdminHandler 返回管理后台端口 (:8088) 的 HTTP 处理器（同时兼容挂载 /portal 便于单端口或本地快速预览）。
 func (s *Server) AdminHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		applySecurityHeaders(w)
 		path := r.URL.Path
 		switch {
 		case path == "/" || path == "/index.html":
@@ -133,6 +237,7 @@ func (s *Server) AdminHandler() http.Handler {
 // PortalHandler 返回 Captive Portal 端口 (:8089) 的 HTTP 处理器，拦截 OS 探针与任意 HTTP 跳转认证页。
 func (s *Server) PortalHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		applySecurityHeaders(w)
 		path := r.URL.Path
 		switch {
 		case path == "/portal" || path == "/portal.html":
@@ -154,6 +259,12 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "仅支持 POST 请求")
 		return
 	}
+	clientIP := extractViewerLANIP(r)
+	if allowed, retrySec := s.limiter.allow(clientIP); !allowed {
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", retrySec))
+		writeError(w, http.StatusTooManyRequests, fmt.Sprintf("尝试次数过多，请 %d 秒后再试", retrySec))
+		return
+	}
 	var req struct {
 		Password string `json:"password"`
 	}
@@ -162,9 +273,15 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.store.VerifyPassword(req.Password) {
+		if locked, retrySec := s.limiter.recordFailure(clientIP); locked {
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", retrySec))
+			writeError(w, http.StatusTooManyRequests, fmt.Sprintf("密码连续错误次数过多，已临时锁定 %d 秒", retrySec))
+			return
+		}
 		writeError(w, http.StatusUnauthorized, "管理密码错误，请重试")
 		return
 	}
+	s.limiter.reset(clientIP)
 	token, err := s.store.CreateSession()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "签发会话失败")
@@ -249,6 +366,9 @@ func (s *Server) handleProtectedAdminAPI(w http.ResponseWriter, r *http.Request)
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		if req.NewPassword != nil && strings.TrimSpace(*req.NewPassword) != "" {
+			s.store.RevokeOtherSessions(extractSessionToken(r))
+		}
 		if err := s.fw.SyncAll(); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -292,6 +412,14 @@ func (s *Server) handleProtectedAdminAPI(w http.ResponseWriter, r *http.Request)
 	case path == "/api/tunnel/stop" && r.Method == http.MethodPost:
 		st := s.tunnel.Stop()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "tunnel": st})
+
+	case path == "/api/tunnel/install" && r.Method == http.MethodPost:
+		msg, err := s.tunnel.InstallCloudflared(r.Context())
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": msg})
 
 	case path == "/api/mock/simulate-device" && r.Method == http.MethodPost:
 		if !s.mockMode {
@@ -591,12 +719,28 @@ func (s *Server) handleCaptiveProbe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 未授权设备：302 跳转至认证门户
+	// 未授权或已断网设备：302 跳转至认证门户并附带状态提示
 	target := s.buildPortalRedirectURL(r)
+	isPaused := false
+	if normMAC, err := model.NormalizeMAC(mac); err == nil {
+		if dev, ok := s.store.GetDevice(normMAC); ok && dev.Status == model.StatusPaused && !dev.IsWhitelist {
+			isPaused = true
+			if strings.Contains(target, "?") {
+				target += "&reason=paused"
+			} else {
+				target += "?reason=paused"
+			}
+		}
+	}
 	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Location", target)
 	w.WriteHeader(http.StatusFound)
-	_, _ = w.Write([]byte("Redirecting to Captive Portal..."))
+	if isPaused {
+		_, _ = w.Write([]byte("<!DOCTYPE html><html><head><meta charset='utf-8'><title>软路由已断网</title></head><body><h3>软路由已断网</h3><p>当前设备的连接已被管理员暂停，请查看 <a href=\"" + target + "\">状态提示页面</a></p></body></html>"))
+	} else {
+		_, _ = w.Write([]byte("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Wi-Fi 认证</title></head><body>正在跳转至 <a href=\"" + target + "\">认证页面</a>...</body></html>"))
+	}
 }
 
 func (s *Server) buildPortalRedirectURL(r *http.Request) string {

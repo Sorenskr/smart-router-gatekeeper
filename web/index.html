@@ -74,6 +74,26 @@
       <button id="btn-protect-viewer" type="button" class="btn btn-primary btn-sm">一键保护当前主机</button>
     </div>
 
+    <!-- 准入认证总开关卡片 -->
+    <section id="master-switch-card" class="panel master-card is-enabled">
+      <div class="master-left">
+        <div class="master-icon" id="master-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>
+        </div>
+        <div>
+          <div class="master-title-row">
+            <span class="master-title">准入认证总开关</span>
+            <span id="master-badge" class="pill pill-success">管控运行中</span>
+          </div>
+          <p id="master-desc" class="master-desc">开启时：新手机需填昵称并审批才能上网，支持断网与并发数量限制；关闭后：所有设备免填昵称直接自由上网。</p>
+        </div>
+      </div>
+      <button id="btn-master-switch" type="button" role="switch" aria-checked="true" class="switch-btn on" title="点击开启或关闭全网准入限制">
+        <span class="switch-track"><span class="switch-thumb"></span></span>
+        <span id="master-switch-text" class="switch-label">已开启</span>
+      </button>
+    </section>
+
     <!-- 紧凑 4 指标卡 -->
     <section class="kpi-grid">
       <article class="panel kpi-card">
@@ -130,21 +150,23 @@
     <section id="tunnel-drawer" class="panel tunnel-card hidden">
       <div class="tunnel-left">
         <div class="tunnel-title-row">
-          <strong>全球异地远程访问 (Cloudflare Tunnel)</strong>
+          <strong>全球异地远程访问 (Cloudflare Tunnel · HTTP/2)</strong>
           <span id="tunnel-badge" class="pill pill-muted">未启用</span>
         </div>
-        <p id="tunnel-desc" class="muted-hint">无需公网 IP 与域名，一键生成加密 HTTPS 地址，在全球任何电脑打开即可实时断网/放行设备。</p>
+        <p id="tunnel-desc" class="muted-hint">已启用 HTTP/2 协议穿透国内网络，无需公网 IP 与域名，一键生成加密 HTTPS 地址。</p>
         <div id="tunnel-url-box" class="tunnel-url-box hidden">
           <span>公网地址：</span>
           <a id="tunnel-public-url" href="#" target="_blank" rel="noopener noreferrer" class="tunnel-url-link"></a>
           <button id="btn-copy-tunnel" type="button" class="btn btn-xs btn-ghost">复制</button>
         </div>
+        <pre id="tunnel-logs" class="tunnel-logs hidden"></pre>
       </div>
       <div class="tunnel-controls">
         <select id="tunnel-mode-select" class="input input-sm">
           <option value="quick">免域名快速隧道 (Quick)</option>
           <option value="token">固定域名隧道 (Token)</option>
         </select>
+        <button id="btn-tunnel-install" type="button" class="btn btn-accent btn-sm hidden">一键安装 cloudflared</button>
         <button id="btn-tunnel-start" type="button" class="btn btn-primary btn-sm">一键开启外网访问</button>
         <button id="btn-tunnel-stop" type="button" class="btn btn-danger-ghost btn-sm hidden">关闭隧道</button>
       </div>
@@ -255,6 +277,7 @@
         <button id="btn-guide-close" type="button" class="btn btn-ghost btn-xs">关闭</button>
       </div>
       <div class="guide-body">
+        <div class="guide-step"><strong>0. 准入管控总开关：</strong>顶部可一键切换「管控已开启 / 自由放行模式」。关闭后所有新连 Wi-Fi 的手机直接上网，无需输入昵称且不受并发数或断网拦截限制。</div>
         <div class="guide-step"><strong>1. 给设备备注（电脑/手机等）：</strong>点击任意设备名称或编辑图标，可直接输入备注或一键点「电脑」「手机」「平板」标签保存。</div>
         <div class="guide-step"><strong>2. 查看联网时间与时长：</strong>设备名称下方显示「何时联网」；点击绿色的「已连时长」胶囊即可在 <code>分钟 → 小时 → 天</code> 之间循环切换。</div>
         <div class="guide-step"><strong>3. 一键断网与定时断网：</strong>点「断网」立即切断全部国内和代理流量；点「定时 ▾」可设置断网几分钟或几小时，倒计时结束自动恢复联网；点「恢复联网」可随时提前放行。</div>
