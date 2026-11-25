@@ -33,6 +33,23 @@ jobs:
           node --check web/dashboard.js
           node --check web/portal.js
 
+      - name: Validate PowerShell Scripts UTF-8 BOM
+        run: |
+          for f in scripts/deploy_to_immortalwrt.ps1 scripts/build.ps1; do
+            bom=$(head -c 3 "$f" | od -An -tx1 | tr -d ' \n')
+            if [ "$bom" != "efbbbf" ]; then
+              echo "ERROR: $f must start with UTF-8 BOM (efbbbf), got $bom"
+              exit 1
+            fi
+          done
+          for f in 双击部署-一键安装到软路由.bat 双击启动-本地模拟体验.bat; do
+            bom=$(head -c 3 "$f" | od -An -tx1 | tr -d ' \n')
+            if [ "$bom" = "efbbbf" ]; then
+              echo "ERROR: $f must NOT contain UTF-8 BOM"
+              exit 1
+            fi
+          done
+
       - name: Go Vet & Unit Tests
         run: |
           go vet ./...

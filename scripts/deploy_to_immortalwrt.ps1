@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$RouterIP = "192.168.6.1",
     [string]$User = "root",
