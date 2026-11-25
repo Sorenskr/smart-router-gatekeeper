@@ -9,6 +9,17 @@ echo ============================================================
 echo   说明：全程已自动跳过 yes/no 确认，只需输入一次密码即可自动装完！
 echo.
 
+if not exist "scripts\deploy_to_immortalwrt.ps1" (
+    echo [错误] 找不到 scripts\deploy_to_immortalwrt.ps1 ！
+    echo.
+    echo 您可能是在压缩包内直接双击了本文件，或者移动了文件夹里的文件。
+    echo 请先右键点击下载的压缩包，选择「全部解压缩」到文件夹，
+    echo 再进入解压后的文件夹里双击本文件！
+    echo.
+    pause
+    exit /b 1
+)
+
 set "ROUTER_IP="
 set /p "ROUTER_IP=1. 请输入软路由 IP (直接回车默认 192.168.6.1): "
 if "%ROUTER_IP%"=="" set "ROUTER_IP=192.168.6.1"

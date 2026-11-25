@@ -38,7 +38,10 @@ if (-not (Test-Path $armBin)) {
     throw "未找到软路由程序文件: $armBin"
 }
 
-$sshVerRaw = (& ssh -V 2>&1) -join ' '
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+$sshVerRaw = (& cmd.exe /c "ssh -V 2>&1") -join ' '
+$ErrorActionPreference = $prevEap
 $sshMajor = 0
 $sshMinor = 0
 if ($sshVerRaw -match 'OpenSSH_for_Windows_(\d+)\.(\d+)|OpenSSH_(\d+)\.(\d+)') {
@@ -91,8 +94,11 @@ try {
 
     $target = "${User}@${RouterIP}"
     Write-Output "`n>>> 步骤 2/4: 上传单文件程序到 ImmortalWrt (${target})..."
+    $ErrorActionPreference = 'Continue'
     & scp @scpOpts -P $SshPort $armBin "${target}:/tmp/gatekeeper.new"
-    if ($LASTEXITCODE -ne 0) {
+    $scpExit = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($scpExit -ne 0) {
         throw "SCP 上传失败！请检查：1) 电脑是否已连接软路由网络；2) 软路由 IP (${RouterIP}) 是否正确；3) SSH 账号(${User})与密码是否正确。"
     }
 
@@ -242,8 +248,11 @@ fi
 
     Write-Output "`n>>> 步骤 3/4: 在 ImmortalWrt 配置 procd 开机自启、防锁死白名单与 nftables..."
     $remoteB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($remoteScript))
+    $ErrorActionPreference = 'Continue'
     & ssh @commonSshOpts -p $SshPort $target "echo '$remoteB64' | base64 -d | sh"
-    if ($LASTEXITCODE -ne 0) {
+    $sshExit = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($sshExit -ne 0) {
         throw "远程初始化脚本执行失败，请检查 SSH 密码或路由磁盘空间"
     }
 
